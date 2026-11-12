@@ -840,14 +840,34 @@ mount_writable(void)
 		                               "/private/var/db/diagnostics/timesync/.migrated", "/private/var/db/uuidtext/.migrated" };
 	int ok, fd, made = 0, files = 0;
 	const char *jb;
+	const char *spec;
 	struct stat st;
 
 	printf("\n-- writable filesystem --\n");
-	ok = mount("ramfs", "/private/var", 0, NULL) == 0;
-	if (!ok) {
-		printf("  mount: %s\n", strerror(errno));
+	/*
+	 * var_apfs=DEVICE[,b=MB]: the data volume is an APFS volume on the phone's storage, not the
+	 * memory filesystem this port started with.  The spec is the whole mount argument, so the
+	 * offset of the container inside the partition ("b=") goes with it.
+	 */
+	spec = boot_arg("var_apfs");
+	ok = 0;
+	if (spec != NULL && spec[0] != 0) {
+		ok = mount("apfs", "/private/var", 0, (void *)spec) == 0;
+		if (ok) {
+			printf("  /private/var: the APFS volume %s\n", spec);
+			check(1, "mount the data volume on /private/var");
+		} else {
+			printf("  mount %s on /private/var: %s; the memory filesystem instead\n", spec,
+			    strerror(errno));
+		}
 	}
-	check(ok, "mount a memory filesystem on /private/var");
+	if (!ok) {
+		ok = mount("ramfs", "/private/var", 0, NULL) == 0;
+		if (!ok) {
+			printf("  mount: %s\n", strerror(errno));
+		}
+		check(ok, "mount a memory filesystem on /private/var");
+	}
 
 	/* the directories of the data volume, as listed in the template that ships with iOS (sysimage/mkvarskel.py) */
 	read_whole(in_image("/etc/var.skel"), skeleton, sizeof(skeleton));
@@ -861,11 +881,27 @@ mount_writable(void)
 		count = split_tabs(line, f, 6);
 		if (count == 5 && f[0][0] == 'd') {
 			int mode = (int)parse_number(f[1], 8);
+			int uid = (int)parse_number(f[2], 10), gid = (int)parse_number(f[3], 10);
+			int err = 0;
+			const char *what = NULL;
 
-			ok = mkdir(f[4], mode) == 0 && chmod(f[4], mode) == 0 &&
-			    chown(f[4], (int)parse_number(f[2], 10), (int)parse_number(f[3], 10)) == 0;
-			if (!ok) {
-				printf("  %s: %s\n", f[4], strerror(errno));
+			/* a directory that is there already is the volume from the boot before */
+			if (mkdir(f[4], mode) != 0) {
+				if (errno != 17 /* EEXIST */) {
+					err = errno, what = "mkdir";
+				}
+			}
+			if (err == 0) {
+				if (chmod(f[4], mode) != 0) {
+					err = errno, what = "chmod";
+				}
+				if (chown(f[4], uid, gid) != 0) {
+					err = errno, what = "chown";
+				}
+			}
+			if (err != 0) {
+				printf("  %s %s: %s\n", what, f[4], strerror(err));
+				ok = 0;
 			}
 			made++;
 		} else if (count == 3 && f[0][0] == 'l') {
@@ -896,6 +932,117 @@ mount_writable(void)
 	check(ok && made > 50, "create the directories of the data volume");
 
 	/*
+	 * scan_probe=1: where the time goes when a directory is walked.  The fallback for
+	 * getattrlistbulk in VFS is a namei per entry plus a getattrlist of it (vfs_attrlist.c,
+	 * readdirattr), and the container manager pays that on every container query -- p287:
+	 * fsScan 0.4-0.9 s per query, 200 queries while LaunchServices builds its store.
+	 */
+	if (boot_arg("scan_probe") != NULL) {
+		struct {
+			unsigned short bitmapcount;
+			unsigned short reserved;
+			unsigned int commonattr;
+			unsigned int volattr;
+			unsigned int dirattr;
+			unsigned int fileattr;
+			unsigned int forkattr;
+		} al;
+		const char *dir = "/Applications";
+		struct timeval t0, t1;
+		char buffer[32 * 1024];
+		int entries, rounds;
+		long usec;
+		unsigned i;
+
+		for (i = 0; i < sizeof(al); i++) {
+			((char *)&al)[i] = 0;
+		}
+		al.bitmapcount = 5;                     /* ATTR_BIT_MAP_COUNT */
+		al.commonattr = 0x80000000u | 0x00000001u | 0x00000008u | 0x02000000u;
+
+		gettimeofday(&t0, NULL);
+		fd = open(dir, O_RDONLY | O_DIRECTORY, 0);
+		entries = 0;
+		if (fd >= 0) {
+			for (;;) {
+				char buf[4096];
+				long got = mini_syscall(344 /* getdirentries64 */, (long)fd, (long)buf,
+				    sizeof(buf), 0, 0, 0);
+
+				if (got <= 0) {
+					break;
+				}
+				entries += (int)got / 16;
+			}
+			close(fd);
+		}
+		gettimeofday(&t1, NULL);
+		usec = (t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_usec - t0.tv_usec);
+		printf("  scan probe: open+getdirentries64 %s: %d entries, %ld us\n", dir, entries, usec);
+
+		gettimeofday(&t0, NULL);
+		fd = open(dir, O_RDONLY | O_DIRECTORY, 0);
+		entries = 0;
+		rounds = 0;
+		if (fd >= 0) {
+			for (;;) {
+				long got = mini_syscall(461 /* getattrlistbulk */, (long)fd, (long)&al,
+				    (long)buffer, sizeof(buffer), 0, 0);
+
+				if (got <= 0) {
+					break;
+				}
+				entries += (int)got;
+				rounds++;
+				if (rounds > 1000) {
+					break;
+				}
+			}
+			close(fd);
+		}
+		gettimeofday(&t1, NULL);
+		usec = (t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_usec - t0.tv_usec);
+		printf("  scan probe: getattrlistbulk %s: %d entries in %d rounds, %ld us\n", dir,
+		    entries, rounds, usec);
+	}
+
+	/*
+	 * cryptex_apps=1: LaunchServices on a real data volume keeps asking for
+	 * /System/Cryptexes/App/System/Applications (p281/p286: every one to five seconds, and it
+	 * never appears -- the image has only Library there), while in RAM it never looks.  The
+	 * system applications of this port are in /Applications, so the App cryptex is pointed at
+	 * the root: a memory filesystem on /System/Cryptexes/App with System -> / inside it.
+	 */
+	if (boot_arg("cryptex_apps") != NULL) {
+		const char *at = "/System/Cryptexes/App";
+
+		if (mount("ramfs", at, 0, NULL) == 0) {
+			symlink("/", "/System/Cryptexes/App/System");
+			check(1, "the App cryptex path points at the root");
+		} else {
+			printf("  mount ramfs on %s: %s\n", at, strerror(errno));
+		}
+	}
+
+	/*
+	 * mcm_db_ram=1: the container manager's own database in memory.  On the APFS data volume
+	 * every SQLite write it makes costs it a second (p285: 0.3-2 s per container query, 4-6 ms
+	 * in RAM), and LaunchServices asks it once per application while building its store, which
+	 * turns a minute into half an hour.  The containers themselves stay on the volume; the
+	 * manager finds them again by scanning it.
+	 */
+	if (boot_arg("mcm_db_ram") != NULL) {
+		const char *db = "/private/var/root/Library/MobileContainerManager";
+
+		mkdir(db, 0700);
+		if (mount("ramfs", db, 0, NULL) == 0) {
+			check(1, "the container manager's database in memory");
+		} else {
+			printf("  mount ramfs on %s: %s\n", db, strerror(errno));
+		}
+	}
+
+	/*
 	 * and the package manager's prefix, when the image was built with one (tools/mk-jb.sh): /jb of
 	 * the system image in RAM, or, with the iOS volume on the flash as the root, /private/preboot/jb
 	 * -- the boot volume, where a rootless jailbreak on an iPhone keeps its Procursus too
@@ -903,6 +1050,10 @@ mount_writable(void)
 	 */
 	jb = stat("/jb", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR ? "/jb" :
 	    stat("/private/preboot/jb", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR ? "/private/preboot/jb" : NULL;
+	/* skip_graft=1: a run that only seeds or tests the data volume does not need the prefix */
+	if (boot_arg("skip_graft") != NULL) {
+		jb = NULL;
+	}
 	if (ok && jb != NULL) {
 		const char *to = "/private/var/jb";
 		int dirs = 0, entries = 0, grafted, users = 0;
@@ -1455,13 +1606,16 @@ main(int argc, char **argv, char **envp)
 	show_system();
 	mount_writable();
 	restore_var();
-	test_files();
-	test_writable();
-	test_memory();
-	test_processes();
-	test_dynamic();
-	test_devices();
-	test_time();
+	/* skip_tests=1: a boot that only has to get the system up does not run the checks */
+	if (boot_arg("skip_tests") == NULL) {
+		test_files();
+		test_writable();
+		test_memory();
+		test_processes();
+		test_dynamic();
+		test_devices();
+		test_time();
+	}
 
 	printf("\n=== %d checks, %d failed ===\n", checks, failures);
 	/* daemons that do not run as root get the console as their standard error too */
