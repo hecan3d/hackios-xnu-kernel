@@ -6,6 +6,7 @@
 #include <kern/kalloc.h>
 #include <libkern/libkern.h>
 #include <miscfs/apfs/apfs.h>
+#include <miscfs/apfs/apfs_write.h>
 #include <sys/attr.h>
 #include <sys/buf.h>
 #include <sys/disk.h>
@@ -23,14 +24,29 @@
 #include <sys/hakios.virtio_blk.h>
 #include <sys/proc.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 #include <libkern/OSAtomic.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+
+/* the vnode-lock side of the same watchdog (vfs_subr.c) */
+extern void vfs_vnode_wd_report(void);
+/* and the name cache (vfs_cache.c) */
+extern void vfs_cache_wd_report(void);
 
 static LCK_GRP_DECLARE(apfs_lck_grp, "apfs");
 
 /* Blocks are read from the device in pieces of this size. */
 #define APFS_META_CHUNK 4096
+
+extern void loader_log_line(const char *line);
+#define apfs_klog(fmt, ...) do { \
+	char _lbuf[256]; \
+	snprintf(_lbuf, sizeof(_lbuf), fmt, ##__VA_ARGS__); \
+	loader_log_line(_lbuf); \
+	kprintf(fmt, ##__VA_ARGS__); \
+} while (0)
+
 
 /*
  * The device, as apfs_lib wants it.  Offsets and lengths are whole container blocks, and
@@ -51,6 +67,7 @@ apfs_dev_read(void *ctx, uint64_t off, void *buf, size_t len)
 
 	off += dc->dc_base;
 	if ((off % dc->dc_devblock) != 0) {
+		apfs_klog("apfs_dev_read: unaligned off=%llu devblock=%u\n", (unsigned long long)off, dc->dc_devblock);
 		return EINVAL;
 	}
 	while (len > 0) {
@@ -60,6 +77,8 @@ apfs_dev_read(void *ctx, uint64_t off, void *buf, size_t len)
 		    (daddr64_t)(off / dc->dc_devblock), APFS_META_CHUNK, NOCRED, &bp);
 
 		if (error) {
+			apfs_klog("apfs_dev_read: buf_meta_bread off=%llu blkno=%llu error=%d\n",
+			    (unsigned long long)off, (unsigned long long)(off / dc->dc_devblock), error);
 			if (bp != NULL) {
 				buf_brelse(bp);
 			}
@@ -132,6 +151,60 @@ apfs_dev_read_data(void *ctx, uint64_t off, void *buf, size_t len)
 	return 0;
 }
 
+/*
+ * apfs_lib's writes: whole blocks, both the metadata of a transaction and the contents of
+ * one file (apfs_write_in_place).  Like apfs_dev_read_data this is called with the volume's
+ * lock let go, so it touches nothing but the device context.  The write goes straight to
+ * the device, past the cache, and is waited for: a commit's blocks have to arrive in the
+ * order it writes them.
+ */
+static int
+apfs_dev_write(void *ctx, uint64_t off, const void *buf, size_t len)
+{
+	struct apfs_devctx *dc = ctx;
+	const char *in = buf;
+
+	off += dc->dc_base;
+	if ((off % dc->dc_devblock) != 0 || (len % dc->dc_devblock) != 0) {
+		return EINVAL;
+	}
+	while (len > 0) {
+		size_t n = len < APFS_DATA_MAX ? len : APFS_DATA_MAX;
+		buf_t bp = buf_alloc(dc->dc_devvp);
+		int error;
+
+		if (bp == NULL) {
+			return ENOMEM;
+		}
+		buf_reset(bp, B_WRITE);
+		buf_setblkno(bp, (daddr64_t)(off / dc->dc_devblock));
+		buf_setlblkno(bp, (daddr64_t)(off / dc->dc_devblock));
+		buf_setcount(bp, (uint32_t)n);
+		buf_setdataptr(bp, (uintptr_t)in);
+		/*
+		 * A write that completes through the buffer layer takes one off the vnode's
+		 * outstanding-write count; that count is only ever put up here, at the start,
+		 * because apfs_lib writes blocks itself and not through cluster_write().
+		 * Without this the first write of each block panics ("numoutput < 0").
+		 */
+		vnode_startwrite(dc->dc_devvp);
+		error = VNOP_STRATEGY(bp);
+		if (error) {
+			vnode_writedone(dc->dc_devvp);          /* no completion will come */
+		} else {
+			error = (int)buf_biowait(bp);
+		}
+		buf_free(bp);
+		if (error) {
+			return error;
+		}
+		in += n;
+		off += n;
+		len -= n;
+	}
+	return 0;
+}
+
 /* ------------------------------------------------------------- where the time goes */
 
 /*
@@ -141,6 +214,13 @@ apfs_dev_read_data(void *ctx, uint64_t off, void *buf, size_t len)
  */
 static struct apfs_mount *apfs_the_mount;
 static LCK_MTX_DECLARE(apfs_pool_lock, &apfs_lck_grp);   /* the pool's threads, and apfs_mounts */
+
+/*
+ * Why the last mount did or did not come up writable, in one line: the kernel's own printf
+ * goes to the console (a UART on the phone), which the boot log brought back over USB does not
+ * carry, so kern.apfs_stats has it too and init can print it where it is seen.
+ */
+char apfs_mount_why[1024];
 
 /*
  * Every APFS mount, for a mount of another container of the same device to find that the
@@ -187,6 +267,129 @@ apfs_ticks_ms(uint64_t ticks)
 
 	absolutetime_to_nanoseconds(ticks, &ns);
 	return ns / 1000000;
+}
+
+/* ---------------------------------------------------------------- the watchdog */
+
+/*
+ * An operation that does not come back is invisible in the counters: they say how much was
+ * waited for in all, not who is still in one.  Every ten seconds, name the operations that
+ * have been going on for more than five, with the process doing them, and the writer's
+ * mutex if it has been held that long -- so a thread that never returns names itself even
+ * when the mount's own lock is free.
+ */
+#define APFS_WD_EVERY_NS    (10ULL * NSEC_PER_SEC)
+#define APFS_WD_SLOW_NS     (5ULL * NSEC_PER_SEC)
+#define APFS_WD_NAMED       8
+
+static uint64_t
+apfs_ns_to_ticks(uint64_t ns)
+{
+	uint64_t t = 0;
+
+	nanoseconds_to_absolutetime(ns, &t);
+	return t;
+}
+
+static void
+apfs_watchdog_call(void *p0, void *p1)
+{
+	struct apfs_mount *am = p0;
+	uint64_t now, slow, deadline, wlock_ms = 0;
+	struct {
+		const char *site;
+		char        name[MAXCOMLEN + 1];
+		uint64_t    ms;
+		uint32_t    tid;
+	} held[APFS_WD_NAMED];
+	char wlock_name[MAXCOMLEN + 1];
+	unsigned n = 0, i;
+	bool wlock = false;
+	static unsigned quiet;         /* ticks with nothing to say, for the once-a-minute line */
+
+	(void)p1;
+	now = apfs_ticks();
+	slow = apfs_ns_to_ticks(APFS_WD_SLOW_NS);
+	wlock_name[0] = 0;
+	if (am->am_ops != NULL && lck_mtx_try_lock(&am->am_lock)) {
+		for (i = 0; i < am->am_nops && n < APFS_WD_NAMED; i++) {
+			struct apfs_op *op = &am->am_ops[i];
+			uint64_t age = now - op->start, ns;
+
+			if (age < slow) {
+				continue;
+			}
+			absolutetime_to_nanoseconds(age, &ns);
+			held[n].site = op->site;
+			strlcpy(held[n].name, op->name, sizeof(held[n].name));
+			held[n].ms = ns / 1000000;
+			held[n].tid = thread_tid(op->th);
+			n++;
+		}
+		if (am->am_wlock_since != 0 && now - am->am_wlock_since >= slow) {
+			uint64_t ns;
+
+			absolutetime_to_nanoseconds(now - am->am_wlock_since, &ns);
+			wlock = true;
+			wlock_ms = ns / 1000000;
+			strlcpy(wlock_name, am->am_wlock_name, sizeof(wlock_name));
+		}
+		lck_mtx_unlock(&am->am_lock);
+	}
+	for (i = 0; i < n; i++) {
+		apfs_klog("apfs: wd: %s[thread %u] in %s for %llu ms\n", held[i].name, held[i].tid,
+		    held[i].site, (unsigned long long)held[i].ms);
+	}
+	if (wlock) {
+		apfs_klog("apfs: wd: the writer's mutex held by %s for %llu ms\n", wlock_name,
+		    (unsigned long long)wlock_ms);
+	}
+	if (n == 0 && !wlock) {
+		/*
+		 * A line a minute to say it is still watching: the absence of the lines above
+		 * then means "nothing was stuck", not "the watchdog never ran".
+		 */
+		if (++quiet % 6 == 0) {
+			apfs_klog("apfs: wd: nothing over 5 s; %u operations going on\n", am->am_nops);
+		}
+	} else {
+		quiet = 0;
+	}
+	/* and the vnode locks: a lookup, an open or a stat can be stuck in the VFS itself */
+	vfs_vnode_wd_report();
+	vfs_cache_wd_report();
+	if (am->am_wd_stop || am->am_wd_call == NULL) {
+		return;
+	}
+	deadline = apfs_ticks() + apfs_ns_to_ticks(APFS_WD_EVERY_NS);
+	thread_call_enter_delayed((thread_call_t)am->am_wd_call, deadline);
+}
+
+void
+apfs_watchdog_begin(struct apfs_mount *am)
+{
+	thread_call_t call = thread_call_allocate(apfs_watchdog_call, am);
+
+	if (call == NULL) {
+		return;
+	}
+	am->am_wd_call = call;
+	am->am_wd_stop = false;
+	thread_call_enter_delayed(call, apfs_ticks() + apfs_ns_to_ticks(APFS_WD_EVERY_NS));
+}
+
+/* (the call is not freed: it may be running on its thread right now, and a mount is one) */
+void
+apfs_watchdog_end(struct apfs_mount *am)
+{
+	thread_call_t call = am->am_wd_call;
+
+	if (call == NULL) {
+		return;
+	}
+	am->am_wd_call = NULL;
+	am->am_wd_stop = true;
+	thread_call_cancel(call);
 }
 
 /* The volume's lock by who takes it, and how many others waited, appended to buf */
@@ -290,6 +493,7 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 		struct apfs_nx *nx = &am->am_nx;
 
 		snprintf(text, cap,
+		    "mount    %s\n"
 		    "pagein   %llu calls  %llu ms  %llu bytes\n"
 		    "read     %llu calls  %llu ms  %llu bytes; from the page cache %llu, read into it %llu (%s)\n"
 		    "device   %llu calls  %llu ms  %llu bytes\n"
@@ -298,6 +502,7 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 		    "blocks   %llu read  %llu cache hits\n"
 		    "lookups  %llu by the name's hash  %llu by reading the directory\n"
 		    "lock     %llu takes  %llu ms waiting  %llu ms held; metadata read without it %llu times\n",
+		    apfs_mount_why,
 		    (unsigned long long)am->am_pagein_calls,
 		    (unsigned long long)apfs_ticks_ms(am->am_pagein_ticks),
 		    (unsigned long long)am->am_pagein_bytes,
@@ -551,11 +756,17 @@ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
 		}
 	} else {
 		error = apfs_inode_get(&am->am_vol, obj_id, &ino);
+		if (error) {
+			apfs_log("node_vnode %llu: inode_get failed: %d\n",
+			    (unsigned long long)obj_id, error);
+		}
 		if (error == 0) {
 			uint32_t i;
 
 			error = apfs_inode_size(&am->am_vol, &ino, &size);
 			if (error) {
+				apfs_log("node_vnode %llu: inode_size failed: %d\n",
+				    (unsigned long long)obj_id, error);
 				size = ino.size;       /* the stream's size is still better than nothing */
 				error = 0;
 			}
@@ -581,6 +792,8 @@ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
 	case APFS_S_IFIFO:  vtype = VFIFO; break;
 	case APFS_S_IFSOCK: vtype = VSOCK; break;
 	default:
+		apfs_log("node_vnode %llu: unknown mode 0%o\n",
+		    (unsigned long long)obj_id, (unsigned)ino.mode);
 		return EIO;
 	}
 
@@ -612,6 +825,8 @@ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
 
 	error = vnode_create(VNCREATE_FLAVOR, VCREATESIZE, &vfsp, &an->an_vp);
 	if (error) {
+		apfs_log("node_vnode %llu: vnode_create failed: %d\n",
+		    (unsigned long long)obj_id, error);
 		kfree_type(struct apfs_node, an);
 		return error;
 	}
@@ -793,17 +1008,24 @@ apfs_node_detach(struct apfs_node *an)
 	apfs_unlock(am);
 }
 
-/* apfs_lib lets go of the mount's lock round decompression, through these */
+/*
+ * apfs_lib asks these around a device read and round decompression.  They do
+ * nothing: the lock stays for the device work.  A transfer of the UFS block
+ * service is set up one at a time (ufs_write/ufs_write_restore), so a read left
+ * in flight while a commit wrote a block came back with another block's content
+ * -- bad checksums, nodes lost -- and the write was lost.  Slower, but the bus
+ * is taken by one transfer at a time.
+ */
 static void
 apfs_lib_unlock(void *ctx)
 {
-	apfs_unlock_inner((struct apfs_mount *)ctx);     /* the operation goes on */
+	(void)ctx;
 }
 
 static void
 apfs_lib_relock(void *ctx)
 {
-	apfs_lock_inner((struct apfs_mount *)ctx);
+	(void)ctx;
 }
 
 /* ------------------------------------------------------- threads for one request */
@@ -965,6 +1187,7 @@ apfs_pool_start(void)
 static void
 apfs_free_mount(struct apfs_mount *am)
 {
+	apfs_watchdog_end(am);
 	if (am->am_synth != NULL) {
 		kfree_data(am->am_synth, APFS_SYNTH_MAX * sizeof(*am->am_synth));
 	}
@@ -972,11 +1195,15 @@ apfs_free_mount(struct apfs_mount *am)
 		kfree_data(am->am_iobuf[--am->am_iobuf_kept], am->am_iobuf_size);
 	}
 	apfs_nx_close(&am->am_nx);
+	if (am->am_ops != NULL) {
+		kfree_data(am->am_ops, APFS_OPS_MAX * sizeof(am->am_ops[0]));
+	}
 	if (am->am_procs != NULL) {
 		kfree_data(am->am_procs, APFS_LOCK_PROCS * sizeof(am->am_procs[0]));
 	}
 	lck_spin_destroy(&am->am_iobuf_spin, &apfs_lck_grp);
 	lck_spin_destroy(&am->am_procs_spin, &apfs_lck_grp);
+	lck_mtx_destroy(&am->am_wlock, &apfs_lck_grp);
 	lck_mtx_destroy(&am->am_lock, &apfs_lck_grp);
 	kfree_type(struct apfs_mount, am);
 }
@@ -986,10 +1213,13 @@ apfs_free_mount(struct apfs_mount *am)
  * saying in its superblock how big it is (nx_block_count blocks of nx_block_size), so the
  * N-th starts where the one before it ends -- the RAM disks of this port hold several (the
  * boot volume, a cryptex) and so may the phone's darwin partition.  volume < 0: the first
- * that has a root directory.
+ * that has a root directory.  base: where the first container starts (the data volume of the
+ * phone is 8 GiB into userdata, after the system's own container), 0 when it is the device's
+ * beginning.
  */
 static int
-apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t container, int volume)
+apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint64_t base,
+    uint32_t container, int volume)
 {
 	struct apfs_mount *am;
 	struct apfs_devctx *dc;
@@ -998,18 +1228,24 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 	uint32_t devblock = 0;
 	uint64_t devblocks = 0, nx_size = 0;
 	int error;
+	int rw = 0;
+	bool writable = false;
 
 	if (VNOP_IOCTL(devvp, DKIOCGETBLOCKSIZE, (caddr_t)&devblock, 0, ctx) != 0 ||
 	    devblock == 0 || (APFS_META_CHUNK % devblock) != 0) {
+		apfs_klog("apfs_mount_common: DKIOCGETBLOCKSIZE error/bad: devblock=%u\n", devblock);
 		return EINVAL;
 	}
 	(void)VNOP_IOCTL(devvp, DKIOCGETBLOCKCOUNT, (caddr_t)&devblocks, 0, ctx);
+	apfs_klog("apfs_mount_common: devblock=%u devblocks=%llu base=%llu container=%u volume=%d\n",
+	    devblock, (unsigned long long)devblocks, (unsigned long long)base, container, volume);
 
 	am = kalloc_type(struct apfs_mount, Z_WAITOK | Z_ZERO);
 	if (am == NULL) {
 		return ENOMEM;
 	}
 	lck_mtx_init(&am->am_lock, &apfs_lck_grp, LCK_ATTR_NULL);
+	lck_mtx_init(&am->am_wlock, &apfs_lck_grp, LCK_ATTR_NULL);
 	lck_spin_init(&am->am_iobuf_spin, &apfs_lck_grp, LCK_ATTR_NULL);
 	lck_spin_init(&am->am_procs_spin, &apfs_lck_grp, LCK_ATTR_NULL);
 	{
@@ -1019,6 +1255,8 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 		am->am_ubc_read = (ubc != 0);
 	}
 	am->am_procs = kalloc_data(APFS_LOCK_PROCS * sizeof(am->am_procs[0]), Z_WAITOK | Z_ZERO);
+	am->am_ops = kalloc_data(APFS_OPS_MAX * sizeof(am->am_ops[0]), Z_WAITOK | Z_ZERO);
+	apfs_watchdog_begin(am);
 	am->am_mp = mp;
 	am->am_devvp = devvp;
 	am->am_devblock = devblock;
@@ -1030,6 +1268,7 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 	}
 	dc->dc_devvp = devvp;
 	dc->dc_devblock = devblock;
+	dc->dc_base = base;
 	{
 		uint8_t *sb = kalloc_data(APFS_META_CHUNK, Z_WAITOK);
 		uint64_t devsize = devblocks * (uint64_t)devblock;
@@ -1042,7 +1281,13 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 
 			error = apfs_dev_read(dc, 0, sb, APFS_META_CHUNK);
 			if (error == 0 && memcmp(sb + 32, "NXSB", 4) != 0) {
+				apfs_klog("apfs_mount_common: i=%u base=%llu magic mismatch: %.4s (0x%08x), bytes 0..16: %08x %08x %08x %08x\n",
+				    i, (unsigned long long)dc->dc_base, (char *)sb + 32, *(uint32_t *)(sb + 32),
+				    *(uint32_t *)(sb + 0), *(uint32_t *)(sb + 4), *(uint32_t *)(sb + 8), *(uint32_t *)(sb + 12));
 				error = EINVAL;         /* (no container here: as the root, the next filesystem's turn) */
+			}
+			if (error) {
+				apfs_klog("apfs_mount_common: dev_read error=%d at base=%llu\n", error, (unsigned long long)dc->dc_base);
 			}
 			if (error) {
 				break;
@@ -1055,8 +1300,8 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 			nx_size = bc * bs;
 			if (bs < 4096 || bc == 0 || (nx_size % devblock) != 0 ||
 			    (devsize != 0 && dc->dc_base + nx_size > devsize)) {
-				printf("apfs: container %u: %llu blocks of %u do not fit the device\n", i,
-				    (unsigned long long)bc, bs);
+				apfs_klog("apfs: container %u: %llu blocks of %u do not fit the device (devsize=%llu)\n", i,
+				    (unsigned long long)bc, bs, (unsigned long long)devsize);
 				error = EINVAL;
 				break;
 			}
@@ -1075,21 +1320,25 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 		}
 	}
 
+	/*
+	 * Writes are opt-in: without apfs_rw=1 the device takes none, and apfs_lib answers
+	 * EROFS exactly as it always has.  The mount stays read-only then, too.
+	 */
+	(void)PE_parse_boot_argn("apfs_rw", &rw, sizeof(rw));
 	bzero(&dev, sizeof(dev));
 	dev.ctx = dc;
 	dev.size = nx_size;
 	dev.read = apfs_dev_read;
 	dev.read_data = apfs_dev_read_data;
+	if (rw != 0) {
+		dev.write = apfs_dev_write;
+	}
 
 	error = apfs_nx_open(&am->am_nx, &dev);
 	if (error) {
-		/*
-		 * EINVAL means the magic was not there, so this is not an APFS container at
-		 * all: as the root filesystem that lets vfs_mountroot() try the next one
-		 * without a word.
-		 */
+		apfs_klog("apfs_mount_common: apfs_nx_open returned %d\n", error);
 		if (error != EINVAL) {
-			printf("apfs: cannot read the container: %d\n", error);
+			apfs_klog("apfs: cannot read the container: %d\n", error);
 		}
 		kfree_type(struct apfs_devctx, dc);
 		apfs_free_mount(am);
@@ -1156,7 +1405,7 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 		}
 		apfs_unlock(am);
 		if (!got) {
-			printf("apfs: no readable volume with a root directory\n");
+			apfs_klog("apfs: no readable volume with a root directory\n");
 			kfree_type(struct apfs_devctx, dc);
 			apfs_free_mount(am);
 			return EINVAL;
@@ -1164,8 +1413,49 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 	}
 	am->am_root_id = APFS_ROOT_DIR_INO_NUM;
 
+	{
+		const char *why = NULL;
+
+		/*
+		 * The caller may have asked for read-only (stage0 mounts the RAM disk's volume
+		 * so); that is honoured.  Otherwise the one answer: the device, the seal, the
+		 * snapshots, the role.
+		 */
+		/*
+		 * The vfs entry of this filesystem says MNT_RDONLY, so a mount(2) starts with
+		 * it set and VFS marks MNTK_WANTRDWR instead when the caller did not ask for
+		 * read-only.  The root (apfs_mountroot) has no caller: it cleared the flag.
+		 */
+		writable = ((vfs_flags(mp) & MNT_RDONLY) == 0 ||
+		    (mp->mnt_kern_flag & MNTK_WANTRDWR) != 0) &&
+		    apfs_write_volume_ok(&am->am_vol, &why) == 0;
+		snprintf(apfs_mount_why, sizeof(apfs_mount_why),
+		    "volume \"%s\" base %llu rw %d write %d flags 0x%x kern 0x%x role 0x%x "
+		    "writable %d: %s", am->am_vol.name, (unsigned long long)(base >> 20), rw,
+		    dev.write != NULL, (unsigned)vfs_flags(mp),
+		    (unsigned)(mp->mnt_kern_flag & MNTK_WANTRDWR), am->am_vol.role, (int)writable,
+		    why != NULL ? why : "-");
+		printf("apfs: mount %s\n", apfs_mount_why);
+		if (dev.write != NULL && !writable) {
+			printf("apfs: volume %u stays read-only: %s\n", am->am_vol.index,
+			    why != NULL ? why : "mounted read-only by the caller");
+		}
+	}
+
 	vfs_setfsprivate(mp, am);
-	vfs_setflags(mp, MNT_RDONLY | MNT_LOCAL);
+	vfs_setflags(mp, MNT_LOCAL);
+	if (writable) {
+		vfs_clearflags(mp, MNT_RDONLY);
+	} else {
+		vfs_setflags(mp, MNT_RDONLY);
+	}
+	{
+		size_t at = strlen(apfs_mount_why);
+
+		snprintf(apfs_mount_why + (at < sizeof(apfs_mount_why) ? at : 0),
+		    sizeof(apfs_mount_why) - (at < sizeof(apfs_mount_why) ? at : 0),
+		    "; after: flags 0x%x", (unsigned)vfs_flags(mp));
+	}
 	vfs_setlocklocal(mp);
 
 	sp = vfs_statfs(mp);
@@ -1174,9 +1464,33 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 	sp->f_blocks = am->am_nx.block_count;
 	sp->f_bfree = 0;
 	sp->f_bavail = 0;
+	if (writable) {
+		struct apfs_spaceman sm;
+
+		/*
+		 * apfs_lib reads the checkpoint map and the manager itself here, and a block
+		 * missing from its cache is read with the mount's lock let go of and taken back
+		 * (nx_block_unlocked).  This is after the volume was opened, so take the lock as
+		 * every other call into apfs_lib does: without it nx_unlock() finds the mutex
+		 * owned by nobody.
+		 */
+		apfs_lock(am);
+		if (apfs_spaceman_open(&am->am_nx, &sm) == 0) {
+			/*
+			 * In blocks, not bytes: f_bsize says what a block is, and f_blocks is already a
+			 * count of them.  Written in bytes the free space came out 4096 times the size of
+			 * the volume, and iOS -- which multiplies by f_bsize itself -- showed a 52 GB
+			 * volume with 0 KB available.
+			 */
+			sp->f_bfree = sm.free_count;
+			sp->f_bavail = sp->f_bfree;
+			apfs_spaceman_close(&sm);
+		}
+		apfs_unlock(am);
+	}
 	sp->f_bused = am->am_vol.alloc_count;
 	sp->f_files = am->am_vol.num_files + am->am_vol.num_dirs;
-	sp->f_ffree = 0;
+	sp->f_ffree = 1000000;   /* the real thing reports free inodes; 0 made file-saving clients think the volume was full */
 	/* (several volumes of one device are told apart by which container and volume) */
 	sp->f_fsid.val[0] = (int32_t)vnode_specrdev(devvp);
 	sp->f_fsid.val[1] = (int32_t)((vfs_typenum(mp) & 0xff) | (container << 8) | (am->am_vol.index << 20));
@@ -1188,6 +1502,10 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 	am->am_next = apfs_mounts;
 	apfs_mounts = am;
 	lck_mtx_unlock(&apfs_pool_lock);
+	if (writable) {
+		printf("apfs: volume %u mounted read-write, %llu MB free\n", am->am_vol.index,
+		    (unsigned long long)(sp->f_bfree >> 20));
+	}
 	printf("apfs: volume %u \"%s\" of container %u (at %llu MB): %llu files, %llu directories, %llu blocks of %u used\n",
 	    am->am_vol.index, am->am_vol.name, container, (unsigned long long)(dc->dc_base >> 20), (unsigned long long)am->am_vol.num_files,
 	    (unsigned long long)am->am_vol.num_dirs,
@@ -1208,7 +1526,12 @@ apfs_mountroot(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 
 	(void)PE_parse_boot_argn("apfs_root_c", &c, sizeof(c));
 	(void)PE_parse_boot_argn("apfs_root_v", &v, sizeof(v));
-	return apfs_mount_common(mp, devvp, ctx, c, v);
+	/*
+	 * The root stays read-only whatever apfs_rw says: the volume it is mounted from is
+	 * iOS's own (or a copy of it), and the one this port writes is mounted over
+	 * /private/var later.  apfs_mount_common sees MNT_RDONLY and keeps it.
+	 */
+	return apfs_mount_common(mp, devvp, ctx, 0, c, v);
 }
 
 /*
@@ -1223,6 +1546,7 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 	char *path;
 	vnode_t vp = NULLVP;
 	size_t len = 0;
+	uint64_t base = 0;
 	uint32_t container = 0;
 	int volume = -1;
 	int error;
@@ -1236,6 +1560,7 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 		return apfs_mountroot(mp, devvp, ctx);
 	}
 	if (data == USER_ADDR_NULL) {
+		apfs_klog("apfs_mount: data is NULL!\n");
 		return EINVAL;
 	}
 	path = kalloc_data(MAXPATHLEN, Z_WAITOK);
@@ -1249,7 +1574,10 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 	} else {
 		error = copyinstr(data, path, MAXPATHLEN, &len);
 	}
-	/* "DEVICE[,c=N][,v=M]": the container (from 0) and the volume (by index) */
+	apfs_klog("apfs_mount: copied path='%s' error=%d len=%zu kernelmount=%d\n",
+	    path, error, len, (int)vfs_iskernelmount(mp));
+	/* "DEVICE[,c=N][,v=M][,b=MB]": the container (from 0), the volume (by index), and where
+	 * the first container starts on the device (the phone's data volume, 8 GiB into userdata) */
 	if (error == 0) {
 		char *opt = strchr(path, ',');
 
@@ -1261,6 +1589,8 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 				container = (uint32_t)strtoul(opt + 3, NULL, 10);
 			} else if (strncmp(opt + 1, "v=", 2) == 0) {
 				volume = (int)strtoul(opt + 3, NULL, 10);
+			} else if (strncmp(opt + 1, "b=", 2) == 0) {
+				base = (uint64_t)strtoul(opt + 3, NULL, 10) << 20;
 			} else {
 				error = EINVAL;
 			}
@@ -1269,6 +1599,8 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 	}
 	if (error == 0) {
 		error = vnode_lookup(path, 0, &vp, ctx);
+		apfs_klog("apfs_mount: vnode_lookup %s -> error=%d vp=%p isblk=%d\n",
+		    path, error, vp, vp ? vnode_isblk(vp) : 0);
 	}
 	if (error == 0 && !vnode_isblk(vp)) {
 		error = ENOTBLK;
@@ -1276,6 +1608,8 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 	if (error == 0) {
 		bool shared = false;
 
+		apfs_klog("apfs_mount: path=%s base=%llu container=%u volume=%d\n",
+		    path, (unsigned long long)base, container, volume);
 		error = VNOP_OPEN(vp, FREAD, ctx);
 		if (error == EBUSY && apfs_device_held(vnode_specrdev(vp))) {
 			/*
@@ -1286,12 +1620,15 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 			shared = true;
 			error = 0;
 		}
+		apfs_klog("apfs_mount: VNOP_OPEN error=%d shared=%d rdev=0x%x held=%d\n",
+		    error, (int)shared, (unsigned)vnode_specrdev(vp), (int)apfs_device_held(vnode_specrdev(vp)));
 		if (error == 0) {
 			/*
 			 * The iocount from the lookup is kept for as long as the volume is
 			 * mounted; apfs_unmount() closes and drops it.
 			 */
-			error = apfs_mount_common(mp, vp, ctx, container, volume);
+			error = apfs_mount_common(mp, vp, ctx, base, container, volume);
+			apfs_klog("apfs_mount: apfs_mount_common returned %d\n", error);
 			if (error == 0) {
 				APFS_MP(mp)->am_owns_devvp = true;
 				APFS_MP(mp)->am_shares_devvp = shared;
@@ -1373,14 +1710,35 @@ apfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 	uint64_t files = am->am_vol.num_files + am->am_vol.num_dirs;
 
 	VFSATTR_RETURN(fsap, f_objcount, files);
-	VFSATTR_RETURN(fsap, f_bsize, am->am_nx.block_size);
-	VFSATTR_RETURN(fsap, f_iosize, am->am_nx.block_size);
-	VFSATTR_RETURN(fsap, f_blocks, am->am_nx.block_count);
-	VFSATTR_RETURN(fsap, f_bfree, 0);
-	VFSATTR_RETURN(fsap, f_bavail, 0);
-	VFSATTR_RETURN(fsap, f_bused, am->am_vol.alloc_count);
-	VFSATTR_RETURN(fsap, f_files, files);
-	VFSATTR_RETURN(fsap, f_ffree, 0);
+	/*
+	 * The free space, for the volume attributes as well as for statfs(2): the volume says
+	 * VOL_CAP_FMT_FAST_STATFS, so iOS asks here (getattrlist) rather than through statfs, and
+	 * zeros here are what put "iPhone Storage Full" on a volume with fifty gigabytes free.
+	 * The space manager is read at every ask: it is Settings and the store's build that ask,
+	 * not every file call.
+	 */
+	{
+		uint64_t free_blocks = 0;
+
+		if (!vfs_isrdonly(mp)) {
+			struct apfs_spaceman sm;
+
+			apfs_lock(am);
+			if (apfs_spaceman_open(&am->am_nx, &sm) == 0) {
+				free_blocks = sm.free_count;
+				apfs_spaceman_close(&sm);
+			}
+			apfs_unlock(am);
+		}
+		VFSATTR_RETURN(fsap, f_bsize, am->am_nx.block_size);
+		VFSATTR_RETURN(fsap, f_iosize, am->am_nx.block_size);
+		VFSATTR_RETURN(fsap, f_blocks, am->am_nx.block_count);
+		VFSATTR_RETURN(fsap, f_bfree, free_blocks);
+		VFSATTR_RETURN(fsap, f_bavail, free_blocks);
+		VFSATTR_RETURN(fsap, f_bused, am->am_vol.alloc_count);
+		VFSATTR_RETURN(fsap, f_files, files);
+		VFSATTR_RETURN(fsap, f_ffree, free_blocks);
+	}
 
 	if (VFSATTR_IS_ACTIVE(fsap, f_capabilities)) {
 		vol_capabilities_attr_t *cap = &fsap->f_capabilities;

@@ -1,11 +1,12 @@
 /*
- * APFS on-disk layout, read side.
+ * APFS on-disk layout.
  *
  * Written from Apple's "Apple File System Reference" (2020-06-22), which is the only
  * description of the format there is.  Names and field order follow that document, so
- * that a reader can hold the two side by side; what the document calls out but we never
- * read on the way to a file's bytes (the space manager, the reaper, fusion, encryption
- * rolling, snapshots) is left out rather than copied in unused.
+ * that a reader can hold the two sides by side; what the document calls out but we never
+ * read (the reaper, fusion, encryption rolling, snapshots) is left out rather than copied
+ * in unused.  The space manager is here because writing needs it: nothing can be
+ * allocated or given back without it, and the reader never looks at it.
  *
  * Everything here is little-endian on disk and is read straight out of a block, so the
  * structures must match the disk byte for byte.  tools/apfs/fmt_check.c prints every
@@ -64,6 +65,8 @@ struct apfs_obj_phys {
 #define APFS_OBJECT_TYPE_BTREE          0x00000002  /* a tree's root node */
 #define APFS_OBJECT_TYPE_BTREE_NODE     0x00000003  /* any other node */
 #define APFS_OBJECT_TYPE_SPACEMAN       0x00000005
+#define APFS_OBJECT_TYPE_SPACEMAN_CAB   0x00000006  /* a block of chunk-info block addresses */
+#define APFS_OBJECT_TYPE_SPACEMAN_CIB   0x00000007  /* a block of chunk records */
 #define APFS_OBJECT_TYPE_SPACEMAN_BITMAP 0x00000008
 #define APFS_OBJECT_TYPE_OMAP           0x0000000b
 #define APFS_OBJECT_TYPE_CHECKPOINT_MAP 0x0000000c
@@ -181,6 +184,127 @@ struct apfs_checkpoint_map_phys {
 	uint32_t             cpm_flags;
 	uint32_t             cpm_count;
 	struct apfs_checkpoint_mapping cpm_map[];
+};
+
+/*
+ * The space manager
+ *
+ * Which blocks of the container are in use, and where the next allocation may come from.
+ * The read path never needs it -- a file's own extent records say where its bytes are --
+ * but nothing can be written without it: every block a transaction writes has to be one
+ * this says is free, and every block it gives up has to be marked so.
+ *
+ * A container is cut into chunks of sm_blocks_per_chunk blocks, each with one block of
+ * bitmap (a bit per block of the chunk, at the bitmap block's own offset 0 -- it is not an
+ * object and carries no header or checksum).  The chunk-info blocks hold a record per
+ * chunk (where it begins, how many blocks, how many free, where its bitmap is), and when
+ * there are many of them a block of addresses points at those instead.
+ *
+ * Those blocks are allocated out of an internal pool of their own: sm_ip_base and
+ * sm_ip_block_count blocks, with a bitmap of their own (sm_ip_bm_base, a ring of
+ * sm_ip_bm_block_count copies, one live at a time, the rest kept so that the previous
+ * checkpoint's copy is not overwritten while it may still be read).
+ */
+#define APFS_SD_COUNT 2      /* devices: the container's own, and tier2 of a Fusion set */
+#define APFS_SFQ_COUNT 3     /* free queues: the internal pool, the main device, tier2 */
+#define APFS_SM_FLAG_VERSIONED             0x00000001
+#define APFS_SPACEMAN_IP_BM_TX_MULTIPLIER  16
+#define APFS_SPACEMAN_IP_BM_INDEX_INVALID  0xFFFF
+#define APFS_SPACEMAN_IP_BM_BLOCK_COUNT_MAX 0xFFFE
+#define APFS_CI_COUNT_MASK                 0x000FFFFF  /* a chunk-info count, low bits */
+
+struct apfs_spaceman_device {
+	uint64_t     sm_block_count;
+	uint64_t     sm_chunk_count;
+	uint32_t     sm_cib_count;
+	uint32_t     sm_cab_count;
+	uint64_t     sm_free_count;
+	uint32_t     sm_addr_offset;    /* where in the object the address array starts */
+	uint32_t     sm_reserved;
+	uint64_t     sm_reserved2;
+};
+
+struct apfs_spaceman_free_queue {
+	uint64_t   sfq_count;           /* blocks waiting here to be reusable */
+	apfs_oid_t sfq_tree_oid;
+	apfs_xid_t sfq_oldest_xid;
+	uint16_t   sfq_tree_node_limit;
+	uint16_t   sfq_pad16;
+	uint32_t   sfq_pad32;
+	uint64_t   sfq_reserved;
+};
+
+#define APFS_SM_ALLOCZONE_INVALID_END_BOUNDARY       0
+#define APFS_SM_ALLOCZONE_NUM_PREVIOUS_BOUNDARIES    7
+#define APFS_SM_DATAZONE_ALLOCZONE_COUNT             8
+
+struct apfs_spaceman_allocation_zone_boundaries {
+	uint64_t saz_zone_start;
+	uint64_t saz_zone_end;
+};
+
+struct apfs_spaceman_allocation_zone_info_phys {
+	struct apfs_spaceman_allocation_zone_boundaries saz_current_boundaries;
+	struct apfs_spaceman_allocation_zone_boundaries
+	    saz_previous_boundaries[APFS_SM_ALLOCZONE_NUM_PREVIOUS_BOUNDARIES];
+	uint16_t saz_zone_id;
+	uint16_t saz_previous_boundary_index;
+	uint32_t saz_reserved;
+};
+
+struct apfs_spaceman_datazone_info_phys {
+	struct apfs_spaceman_allocation_zone_info_phys
+	    sdz_allocation_zones[APFS_SD_COUNT][APFS_SM_DATAZONE_ALLOCZONE_COUNT];
+};
+
+struct apfs_spaceman_phys {
+	struct apfs_obj_phys sm_o;
+	uint32_t     sm_block_size;
+	uint32_t     sm_blocks_per_chunk;
+	uint32_t     sm_chunks_per_cib;
+	uint32_t     sm_cibs_per_cab;
+	struct apfs_spaceman_device sm_dev[APFS_SD_COUNT];
+	uint32_t     sm_flags;
+	uint32_t     sm_ip_bm_tx_multiplier;
+	uint64_t     sm_ip_block_count;
+	uint32_t     sm_ip_bm_size_in_blocks;
+	uint32_t     sm_ip_bm_block_count;
+	uint64_t     sm_ip_bm_base;     /* the first block of the ring of bitmap copies */
+	uint64_t     sm_ip_base;        /* the first block of the internal pool */
+	uint64_t     sm_fs_reserve_block_count;
+	uint64_t     sm_fs_reserve_alloc_count;
+	struct apfs_spaceman_free_queue sm_fq[APFS_SFQ_COUNT];
+	uint16_t     sm_ip_bm_free_head;    /* the copy to write next, and its ring */
+	uint16_t     sm_ip_bm_free_tail;
+	uint32_t     sm_ip_bm_xid_offset;   /* in the copy: the transaction it holds */
+	uint32_t     sm_ip_bitmap_offset;   /* in the object: which copy is live */
+	uint32_t     sm_ip_bm_free_next_offset;
+	uint32_t     sm_version;
+	uint32_t     sm_struct_size;
+	struct apfs_spaceman_datazone_info_phys sm_datazone;
+	/* after the structure: the address array, sm_dev[n].sm_addr_offset into the object */
+};
+
+struct apfs_chunk_info {
+	apfs_xid_t   ci_xid;
+	apfs_paddr_t ci_addr;           /* the chunk's first block */
+	uint32_t     ci_block_count;
+	uint32_t     ci_free_count;
+	apfs_paddr_t ci_bitmap_addr;    /* 0: the whole chunk is free */
+};
+
+struct apfs_chunk_info_block {
+	struct apfs_obj_phys cib_o;
+	uint32_t     cib_index;
+	uint32_t     cib_chunk_info_count;
+	struct apfs_chunk_info cib_chunk_info[];
+};
+
+struct apfs_cib_addr_block {
+	struct apfs_obj_phys cab_o;
+	uint32_t     cab_index;
+	uint32_t     cab_cib_count;
+	apfs_paddr_t cab_cib_addr[];
 };
 
 /*
@@ -702,6 +826,7 @@ struct apfs_x_field {
 #define APFS_XF_DATA_DEPENDENT    0x0001
 #define APFS_XF_DO_NOT_COPY       0x0002
 #define APFS_XF_CHILDREN_INHERIT  0x0008
+#define APFS_XF_SYSTEM_FIELD      0x0020  /* the system made it, an imitator may not */
 
 /* file mode bits, as APFS stores them */
 #define APFS_S_IFMT   0170000

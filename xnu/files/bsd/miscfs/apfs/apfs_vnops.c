@@ -12,6 +12,8 @@
 #include <sys/attr.h>
 #include <sys/dirent.h>
 #include <sys/errno.h>
+#include <sys/kauth.h>
+#include <sys/lockf.h>
 #include <sys/namei.h>
 #include <sys/stat.h>
 #include <sys/systm.h>
@@ -21,8 +23,79 @@
 #include <sys/unistd.h>
 #include <sys/vnode_internal.h>
 #include <sys/xattr.h>
+#include <kern/clock.h>
+#include <miscfs/apfs/apfs_write.h>
 #include <os/atomic_private.h>
 #include <vfs/vfs_support.h>
+
+/*
+ * A name with its terminator, as apfs_lib wants it.  apfs_fs_write.c's own limit -- 1024,
+ * the room its keys are made with -- not the 255 of a path component: namei has refused
+ * anything longer before this is reached.
+ */
+#define APFS_NAME_BUF 1024
+
+/* The wall clock, in nanoseconds since the Unix epoch: what an inode records. */
+static uint64_t
+apfs_now(void)
+{
+	uint64_t sec = 0, nsec = 0;
+
+	clock_get_calendar_nanotime(&sec, &nsec);
+	return sec * 1000000000ULL + nsec;
+}
+
+/*
+ * Is this volume one this driver may change, and was it mounted for writing?  apfs_write.c
+ * has the first answer; the second is the caller's (stage0 mounts the RAM disk's volume
+ * read-only on purpose, and VFS does not stand in the way of every operation).
+ */
+
+static bool
+apfs_writable(struct apfs_mount *am)
+{
+	const char *why = NULL;
+	bool asked = (vfs_flags(am->am_mp) & MNT_RDONLY) == 0 ||
+	    (am->am_mp->mnt_kern_flag & MNTK_WANTRDWR) != 0;
+	bool ok = asked && apfs_write_volume_ok(&am->am_vol, &why) == 0;
+
+	return ok;
+}
+
+/* Take the inode and the size of a vnode again: after an operation changed them. */
+static void
+apfs_node_refresh(struct apfs_mount *am, struct apfs_node *an)
+{
+	struct apfs_inode ino;
+	uint64_t size;
+
+	apfs_lock(am);
+	if (apfs_inode_get(&am->am_vol, an->an_id, &ino) == 0) {
+		size = an->an_size;
+		if (apfs_inode_size(&am->am_vol, &ino, &size) != 0) {
+			size = ino.size;
+		}
+		an->an_ino = ino;
+		an->an_size = size;
+		an->an_mode = ino.mode;
+		an->an_parent = ino.parent_id;
+	} else {
+		/*
+		 * No inode: the last name went and the file was not open, so it is gone.  The
+		 * vnode that named it still answers fstat until it is reclaimed, and its link
+		 * count is none.
+		 */
+		an->an_ino.nchildren = 0;
+	}
+	apfs_unlock(am);
+}
+
+/* A timespec, as an inode keeps a time: nanoseconds since the Unix epoch. */
+static uint64_t
+apfs_ts_ns(struct timespec ts)
+{
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 /* How much is read out of a file at a time when copying into a uio. */
 
@@ -173,12 +246,6 @@ lock_take(struct apfs_mount *am, const char *site, bool relock)
 }
 
 void
-apfs_lock_inner(struct apfs_mount *am)
-{
-	lock_take(am, NULL, true);
-}
-
-void
 apfs_unlock_inner(struct apfs_mount *am)
 {
 	static uint64_t limits[4];
@@ -215,10 +282,14 @@ void
 apfs_lock_at(struct apfs_mount *am, const char *site)
 {
 	lock_take(am, site, false);
-	if (am->am_nops < APFS_OPS_MAX) {
-		am->am_ops[am->am_nops].th = current_thread();
-		am->am_ops[am->am_nops].epoch = am->am_nx.epoch;
-		am->am_ops[am->am_nops].site = site;
+	if (am->am_ops != NULL && am->am_nops < APFS_OPS_MAX) {
+		struct apfs_op *op = &am->am_ops[am->am_nops];
+
+		op->th = current_thread();
+		op->epoch = am->am_nx.epoch;
+		op->site = site;
+		op->start = apfs_ticks();
+		proc_selfname(op->name, sizeof(op->name));
 		am->am_nops++;
 	} else {
 		am->am_untracked++;
@@ -267,7 +338,7 @@ apfs_vp_inode(vnode_t vp, struct apfs_inode *ino)
 /* ------------------------------------------------------------------ lookup */
 
 static int
-apfs_vnop_lookup(struct vnop_lookup_args *ap)
+apfs_lookup_impl(struct vnop_lookup_args *ap)
 {
 	vnode_t dvp = ap->a_dvp;
 	struct componentname *cnp = ap->a_cnp;
@@ -278,6 +349,7 @@ apfs_vnop_lookup(struct vnop_lookup_args *ap)
 	int error;
 
 	*ap->a_vpp = NULLVP;
+
 	if (!vnode_isdir(dvp)) {
 		return ENOTDIR;
 	}
@@ -304,6 +376,16 @@ apfs_vnop_lookup(struct vnop_lookup_args *ap)
 	}
 	if (error == ENOENT) {
 		os_atomic_inc(&am->am_lookup_negative_hits, relaxed);
+		/*
+		 * "It is not there" is the answer for a lookup; for a name that is to be made it
+		 * is the answer to go on and make it -- the same answer the volume's own ENOENT
+		 * gets below.  A negative entry in the name cache must not turn a create into a
+		 * plain ENOENT.
+		 */
+		if ((cnp->cn_flags & ISLASTCN) &&
+		    (cnp->cn_nameiop == CREATE || cnp->cn_nameiop == RENAME)) {
+			return apfs_writable(am) ? EJUSTRETURN : EROFS;
+		}
 		return ENOENT;
 	}
 
@@ -332,14 +414,27 @@ apfs_vnop_lookup(struct vnop_lookup_args *ap)
 	 */
 	if (error == ENOENT && (cnp->cn_flags & ISLASTCN) &&
 	    (cnp->cn_nameiop == CREATE || cnp->cn_nameiop == RENAME)) {
-		return EROFS;
+		/*
+		 * namei wants EJUSTRETURN, not ENOENT, from the lookup of the last
+		 * component of a name that is to be created: it is the "nothing there,
+		 * go on and make it" answer.  On a volume this driver may not write,
+		 * the answer is the refusal instead (and mkdir of something that does
+		 * exist has failed with EEXIST already, before this).
+		 */
+		return apfs_writable(am) ? EJUSTRETURN : EROFS;
 	}
 	/*
 	 * A name that is not there stays not there (the volume cannot change; a synthetic
 	 * directory added later purges its parent's entries): the name cache says so from now on,
 	 * instead of asking again -- iOS asks for missing files thousands of times after a boot.
 	 */
-	if (error == ENOENT && cnp->cn_nameiop == LOOKUP && (cnp->cn_flags & MAKEENTRY)) {
+	if (error == ENOENT && cnp->cn_nameiop == LOOKUP && (cnp->cn_flags & MAKEENTRY) &&
+	    !apfs_writable(am)) {
+		/*
+		 * Only where the volume cannot change.  On the data volume a name another
+		 * process made a moment ago would stay "not there" here, and the create that
+		 * follows would come back EEXIST.
+		 */
 		cache_enter(dvp, NULLVP, cnp);
 		os_atomic_inc(&am->am_lookup_negative, relaxed);
 	}
@@ -347,6 +442,696 @@ apfs_vnop_lookup(struct vnop_lookup_args *ap)
 		return error;
 	}
 	return apfs_node_vnode(am, id, dvp, cnp, ap->a_vpp);
+}
+
+/*
+ * The operations that change the volume take the writer's mutex around the whole
+ * operation: the mount's own lock is let go of around device reads, and a second
+ * writer entering there would begin a transaction from the same checkpoint.  The
+ * same thread may take it again (a create undoing itself, a write reaching pageout).
+ */
+static void
+apfs_lock_write(struct apfs_mount *am)
+{
+	thread_t self = current_thread();
+
+	if (am->am_wlock_depth != 0 && am->am_wlock_owner == self) {
+		am->am_wlock_depth++;
+		apfs_lock(am);
+		return;
+	}
+	lck_mtx_lock(&am->am_wlock);
+	am->am_wlock_owner = self;
+	am->am_wlock_depth = 1;
+	am->am_wlock_since = apfs_ticks();
+	proc_selfname(am->am_wlock_name, sizeof(am->am_wlock_name));
+	apfs_lock(am);
+}
+
+static void
+apfs_unlock_write(struct apfs_mount *am)
+{
+	apfs_unlock(am);
+	if (--am->am_wlock_depth == 0) {
+		am->am_wlock_owner = NULL;
+		am->am_wlock_since = 0;
+		am->am_wlock_name[0] = 0;
+		lck_mtx_unlock(&am->am_wlock);
+	}
+}
+
+/* ------------------------------------------------------------------ creation and removal */
+
+/*
+ * The name in a componentname is not terminated; apfs_lib wants it so.  ERRNO is 0 or the
+ * error the caller returns.
+ */
+/*
+ * Debug: what the lookup answered, in the string init prints (kern.apfs_stats).  The kernel's
+ * own output goes to the UART on the phone and never comes back over USB.
+ */
+static int
+apfs_vnop_lookup(struct vnop_lookup_args *ap)
+{
+	return apfs_lookup_impl(ap);
+}
+
+static int
+apfs_name(struct componentname *cnp, char *name)
+{
+	if (cnp->cn_namelen >= APFS_NAME_BUF) {
+		return ENAMETOOLONG;
+	}
+	memcpy(name, cnp->cn_nameptr, (size_t)cnp->cn_namelen);
+	name[cnp->cn_namelen] = 0;
+	return 0;
+}
+
+static int
+apfs_vnop_create(struct vnop_create_args *ap)
+{
+	vnode_t dvp = ap->a_dvp;
+	struct componentname *cnp = ap->a_cnp;
+	struct vnode_attr *vap = ap->a_vap;
+	struct apfs_mount *am = APFS_VP_MOUNT(dvp);
+	struct apfs_node *dn = APFS_VP(dvp);
+	kauth_cred_t cred = vfs_context_ucred(ap->a_context);
+	char name[APFS_NAME_BUF];
+	uint64_t id = 0;
+	uint32_t uid = kauth_cred_getuid(cred);
+	uint32_t gid = kauth_cred_getgid(cred);
+	uint16_t mode = APFS_S_IFREG | 0644;
+	int error;
+
+	*ap->a_vpp = NULLVP;
+	if (!apfs_writable(am)) {
+		return EROFS;
+	}
+	if (!vnode_isdir(dvp)) {
+		return ENOTDIR;
+	}
+	if ((error = apfs_name(cnp, name)) != 0) {
+		return error;
+	}
+	if (VATTR_IS_ACTIVE(vap, va_uid)) {
+		uid = vap->va_uid;
+	}
+	if (VATTR_IS_ACTIVE(vap, va_gid)) {
+		gid = vap->va_gid;
+	}
+	if (VATTR_IS_ACTIVE(vap, va_mode)) {
+		mode = APFS_S_IFREG | (vap->va_mode & 07777);
+	}
+
+	apfs_lock_write(am);
+	error = apfs_create_file(&am->am_vol, dn->an_id, name, mode, uid, gid, apfs_now(), &id);
+	apfs_unlock_write(am);
+	cache_purge_negatives(dvp);
+	if (error) {
+		apfs_log("create %s in %llu: %d\n", name, (unsigned long long)dn->an_id, error);
+		return error;
+	}
+	error = apfs_node_vnode(am, id, dvp, cnp, ap->a_vpp);
+	if (error) {
+		apfs_log("create %s: inode %llu, no vnode: %d\n", name,
+		    (unsigned long long)id, error);
+	}
+	if (error) {
+		/* no vnode to hold it: take the file back rather than leave it in the tree */
+		apfs_lock_write(am);
+		(void)apfs_unlink(&am->am_vol, dn->an_id, name, apfs_now());
+		apfs_unlock_write(am);
+	}
+	return error;
+}
+
+/*
+ * A socket or a FIFO is a name, an inode and no data: this is the whole of what mknod needs.
+ * A device node would stand for hardware this volume has no business making, so it is refused.
+ */
+static int
+apfs_vnop_mknod(struct vnop_mknod_args *ap)
+{
+	vnode_t dvp = ap->a_dvp;
+	struct vnode_attr *vap = ap->a_vap;
+	struct apfs_mount *am = APFS_VP_MOUNT(dvp);
+	struct apfs_node *dn = APFS_VP(dvp);
+	kauth_cred_t cred = vfs_context_ucred(ap->a_context);
+	char name[APFS_NAME_BUF];
+	uint64_t id = 0;
+	uint32_t uid = kauth_cred_getuid(cred);
+	uint32_t gid = kauth_cred_getgid(cred);
+	uint16_t type, mode;
+	int error;
+
+	*ap->a_vpp = NULLVP;
+	/* the VFS puts the kind of node in va_type, and only the permission bits in va_mode */
+	switch (vap->va_type) {
+	case VSOCK:
+		type = APFS_S_IFSOCK;
+		break;
+	case VFIFO:
+		type = APFS_S_IFIFO;
+		break;
+	default:
+		return EPERM;
+	}
+	if (!apfs_writable(am)) {
+		return EROFS;
+	}
+	if (!vnode_isdir(dvp)) {
+		return ENOTDIR;
+	}
+	if ((error = apfs_name(ap->a_cnp, name)) != 0) {
+		return error;
+	}
+	if (VATTR_IS_ACTIVE(vap, va_uid)) {
+		uid = vap->va_uid;
+	}
+	if (VATTR_IS_ACTIVE(vap, va_gid)) {
+		gid = vap->va_gid;
+	}
+	mode = (uint16_t)(type | (vap->va_mode & 07777));
+	apfs_lock_write(am);
+	error = apfs_create_file(&am->am_vol, dn->an_id, name, mode, uid, gid, apfs_now(), &id);
+	apfs_unlock_write(am);
+	cache_purge_negatives(dvp);
+	if (error) {
+		apfs_log("mknod %s in %llu: %d\n", name, (unsigned long long)dn->an_id, error);
+		return error;
+	}
+	error = apfs_node_vnode(am, id, dvp, ap->a_cnp, ap->a_vpp);
+	if (error) {
+		apfs_lock_write(am);
+		(void)apfs_unlink(&am->am_vol, dn->an_id, name, apfs_now());
+		apfs_unlock_write(am);
+	}
+	return error;
+}
+
+static int
+apfs_vnop_mkdir(struct vnop_mkdir_args *ap)
+{
+	vnode_t dvp = ap->a_dvp;
+	struct componentname *cnp = ap->a_cnp;
+	struct vnode_attr *vap = ap->a_vap;
+	struct apfs_mount *am = APFS_VP_MOUNT(dvp);
+	struct apfs_node *dn = APFS_VP(dvp);
+	kauth_cred_t cred = vfs_context_ucred(ap->a_context);
+	char name[APFS_NAME_BUF];
+	uint64_t id = 0;
+	uint32_t uid = kauth_cred_getuid(cred);
+	uint32_t gid = kauth_cred_getgid(cred);
+	uint16_t mode = APFS_S_IFDIR | 0755;
+	int error;
+
+	*ap->a_vpp = NULLVP;
+	if (!apfs_writable(am)) {
+		return EROFS;
+	}
+	if (!vnode_isdir(dvp)) {
+		return ENOTDIR;
+	}
+	if ((error = apfs_name(cnp, name)) != 0) {
+		return error;
+	}
+	if (VATTR_IS_ACTIVE(vap, va_uid)) {
+		uid = vap->va_uid;
+	}
+	if (VATTR_IS_ACTIVE(vap, va_gid)) {
+		gid = vap->va_gid;
+	}
+	if (VATTR_IS_ACTIVE(vap, va_mode)) {
+		mode = APFS_S_IFDIR | (vap->va_mode & 07777);
+	}
+
+	apfs_lock_write(am);
+	error = apfs_mkdir(&am->am_vol, dn->an_id, name, mode, uid, gid, apfs_now(), &id);
+	apfs_unlock_write(am);
+	cache_purge_negatives(dvp);
+	if (error) {
+		return error;
+	}
+	error = apfs_node_vnode(am, id, dvp, cnp, ap->a_vpp);
+	if (error) {
+		apfs_lock_write(am);
+		(void)apfs_rmdir(&am->am_vol, dn->an_id, name, apfs_now());
+		apfs_unlock_write(am);
+	}
+	return error;
+}
+
+
+static int
+apfs_vnop_link(struct vnop_link_args *ap)
+{
+	vnode_t vp = ap->a_vp;
+	vnode_t tdvp = ap->a_tdvp;
+	struct apfs_mount *am = APFS_VP_MOUNT(tdvp);
+	struct apfs_node *tn = APFS_VP(tdvp);
+	char name[APFS_NAME_BUF];
+	int error;
+
+	if (!apfs_writable(am)) {
+		return EROFS;
+	}
+	if (vnode_isdir(vp)) {
+		return EPERM;
+	}
+	if (!vnode_isdir(tdvp)) {
+		return ENOTDIR;
+	}
+	if ((error = apfs_name(ap->a_cnp, name)) != 0) {
+		return error;
+	}
+	apfs_lock_write(am);
+	error = apfs_link(&am->am_vol, tn->an_id, name, APFS_VP(vp)->an_id, apfs_now());
+	apfs_unlock_write(am);
+	if (error) {
+		return error;
+	}
+	apfs_node_refresh(am, APFS_VP(vp));
+	cache_purge_negatives(tdvp);
+	return 0;
+}
+
+static int
+apfs_vnop_symlink(struct vnop_symlink_args *ap)
+{
+	vnode_t dvp = ap->a_dvp;
+	struct apfs_mount *am = APFS_VP_MOUNT(dvp);
+	struct apfs_node *dn = APFS_VP(dvp);
+	kauth_cred_t cred = vfs_context_ucred(ap->a_context);
+	char name[APFS_NAME_BUF];
+	uint64_t id = 0;
+	uint32_t uid = kauth_cred_getuid(cred);
+	uint32_t gid = kauth_cred_getgid(cred);
+	uint16_t mode = APFS_S_IFLNK | 0777;
+	size_t target_len;
+	int error;
+
+	*ap->a_vpp = NULLVP;
+	if (!apfs_writable(am)) {
+		return EROFS;
+	}
+	if (!vnode_isdir(dvp)) {
+		return ENOTDIR;
+	}
+	if (ap->a_target == NULL) {
+		return EINVAL;
+	}
+	if ((error = apfs_name(ap->a_cnp, name)) != 0) {
+		return error;
+	}
+	if (ap->a_vap != NULL && VATTR_IS_ACTIVE(ap->a_vap, va_mode)) {
+		mode = (uint16_t)(APFS_S_IFLNK | (ap->a_vap->va_mode & 07777));
+	}
+	target_len = strlen(ap->a_target);
+	apfs_lock_write(am);
+	error = apfs_create_file(&am->am_vol, dn->an_id, name, mode, uid, gid,
+	    apfs_now(), &id);
+	if (error == 0) {
+		error = apfs_setxattr(&am->am_vol, id, APFS_SYMLINK_EA_NAME, ap->a_target,
+		    target_len, APFS_XATTR_FILE_SYSTEM_OWNED, apfs_now());
+	}
+	apfs_unlock_write(am);
+	cache_purge_negatives(dvp);
+	if (error) {
+		return error;
+	}
+	error = apfs_node_vnode(am, id, dvp, ap->a_cnp, ap->a_vpp);
+	if (error) {
+		apfs_lock_write(am);
+		(void)apfs_unlink(&am->am_vol, dn->an_id, name, apfs_now());
+		apfs_unlock_write(am);
+	}
+	return error;
+}
+
+static int
+apfs_vnop_remove(struct vnop_remove_args *ap)
+{
+	vnode_t dvp = ap->a_dvp;
+	vnode_t vp = ap->a_vp;
+	struct apfs_mount *am = APFS_VP_MOUNT(dvp);
+	struct apfs_node *dn = APFS_VP(dvp);
+	char name[APFS_NAME_BUF];
+	int error, keep;
+
+	if (!apfs_writable(am)) {
+		return EROFS;
+	}
+	if (!vnode_isdir(dvp)) {
+		return ENOTDIR;
+	}
+	if (vnode_isdir(vp)) {
+		return EPERM;           /* rmdir() has its own hook */
+	}
+	if ((error = apfs_name(ap->a_cnp, name)) != 0) {
+		return error;
+	}
+
+	/*
+	 * A file that is still open when its last name goes is not deleted here: POSIX keeps
+	 * the file for the reader, and so does this (the inode's link count falls to zero, and
+	 * VNOP_INACTIVE takes the file away at the last close).
+	 */
+	/*
+	 * A file that is deleted is kept, open or not, until its vnode goes inactive: the
+	 * last close is the only place that knows no reader is left.  Deciding here on
+	 * vnode_isinuse() took the inode from under a handle that was still writing it
+	 * ("write inode ...: 2" from SQLite's lock files), and the next write failed.
+	 */
+	keep = 1;
+	apfs_lock_write(am);
+	error = keep ? apfs_unlink_keep(&am->am_vol, dn->an_id, name, apfs_now()) :
+	    apfs_unlink(&am->am_vol, dn->an_id, name, apfs_now());
+	apfs_unlock_write(am);
+	if (error) {
+		apfs_log("remove %s in %llu (open %d): %d\n", name,
+		    (unsigned long long)dn->an_id, keep, error);
+		return error;
+	}
+	if (keep && APFS_VP(vp)->an_ino.nchildren <= 1) {
+		/*
+		 * Only the last name leaves a file with nothing naming it: a file that still has
+		 * another name is not an orphan, and its link count is the one the tree now has.
+		 */
+		APFS_VP(vp)->an_unlinked = true;
+	}
+	/* the link count the tree now has (zero for the last name), not the one it had */
+	apfs_node_refresh(am, APFS_VP(vp));
+	/* the name is gone: no lookup finds it again, and its pages are stale */
+	cache_purge(vp);
+	return 0;
+}
+
+static int
+apfs_vnop_rmdir(struct vnop_rmdir_args *ap)
+{
+	vnode_t dvp = ap->a_dvp;
+	vnode_t vp = ap->a_vp;
+	struct apfs_mount *am = APFS_VP_MOUNT(dvp);
+	struct apfs_node *dn = APFS_VP(dvp);
+	char name[APFS_NAME_BUF];
+	int error;
+
+	if (!apfs_writable(am)) {
+		return EROFS;
+	}
+	if (!vnode_isdir(dvp)) {
+		return ENOTDIR;
+	}
+	if (!vnode_isdir(vp)) {
+		return ENOTDIR;
+	}
+	if ((error = apfs_name(ap->a_cnp, name)) != 0) {
+		return error;
+	}
+
+	apfs_lock_write(am);
+	error = apfs_rmdir(&am->am_vol, dn->an_id, name, apfs_now());
+	apfs_unlock_write(am);
+	if (error) {
+		return error;
+	}
+	cache_purge(vp);
+	return 0;
+}
+
+/* ------------------------------------------------------------------ data and metadata */
+
+/*
+ * Set the length of a file.  Growing is refused by apfs_truncate (see apfs_lib.h): the new
+ * bytes would have to read as zeros and that is a different operation.
+ */
+static int
+apfs_setlength(vnode_t vp, uint64_t len)
+{
+	struct apfs_node *an = APFS_VP(vp);
+	struct apfs_mount *am = an->an_mount;
+	uint64_t old = an->an_size;
+	int error;
+
+	if (len == old) {
+		return 0;
+	}
+	apfs_lock_write(am);
+	error = apfs_truncate(&am->am_vol, an->an_id, len, apfs_now());
+	apfs_unlock_write(am);
+	if (error) {
+		apfs_log("truncate inode %llu to %llu (was %llu): %d\n",
+		    (unsigned long long)an->an_id, (unsigned long long)len,
+		    (unsigned long long)old, error);
+		return error;
+	}
+	if (len < old) {
+		(void)ubc_msync(vp, (off_t)len, (off_t)old, NULL, UBC_PUSHALL | UBC_INVALIDATE);
+	}
+	(void)ubc_setsize(vp, (off_t)len);
+	apfs_node_refresh(am, an);
+	return 0;
+}
+
+/*
+ * Contents.  In place when the write stays inside what the file already has (apfs_write.c
+ * changes no structure for that), appended when it starts at the end; a write that starts
+ * inside and runs past the end is both, in that order.  A hole (a write past the end) is
+ * refused: apfs_truncate does not grow a file either.
+ */
+static int
+apfs_vnop_write(struct vnop_write_args *ap)
+{
+	vnode_t vp = ap->a_vp;
+	struct apfs_node *an = APFS_VP(vp);
+	struct apfs_mount *am = an->an_mount;
+	struct uio *uio = ap->a_uio;
+	uint64_t old = an->an_size;
+	uint64_t off = (uint64_t)uio_offset(uio);
+	size_t len = (size_t)uio_resid(uio);
+	char *buf;
+	int error;
+
+	if (!apfs_writable(am)) {
+		return EROFS;
+	}
+	if (vnode_isdir(vp)) {
+		return EISDIR;
+	}
+	if (len == 0) {
+		return 0;
+	}
+	/* O_APPEND: VFS passes the flag, not an offset at the end (write(2) with the flag set) */
+	if ((ap->a_ioflag & IO_APPEND) != 0) {
+		off = old;
+	}
+	/*
+	 * A write that starts past the end is a hole, and apfs_write_data writes
+	 * those: SQLite extends a WAL shared-memory file by writing one byte at the
+	 * end of each page, and refusing that turned every WAL database into
+	 * "disk I/O error" (SQLITE_IOERR_SHMSIZE).
+	 */
+	buf = apfs_alloc(len);
+	if (buf == NULL) {
+		return ENOMEM;
+	}
+	error = uiomove(buf, len, uio);
+	if (error) {
+		goto out;
+	}
+	/*
+	 * The contents are written past the page cache, so the cache has to be brought into
+	 * line: what a mapping has left dirty in the range goes out first (through pageout),
+	 * and after the write the pages of the range are dropped, so the next read sees what
+	 * was just written instead of what was cached before it.
+	 */
+	if (UBCINFOEXISTS(vp)) {
+		(void)ubc_msync(vp, (off_t)off, (off_t)(off + len), NULL, UBC_PUSHALL);
+	}
+	apfs_lock_write(am);
+	error = apfs_write_data(&am->am_vol, an->an_id, off, buf, len, apfs_now());
+	apfs_unlock_write(am);
+	if (error) {
+		apfs_log("write inode %llu at %llu, %zu bytes: %d\n",
+		    (unsigned long long)an->an_id, (unsigned long long)off, len, error);
+	}
+	if (error == 0) {
+		apfs_node_refresh(am, an);
+		if (UBCINFOEXISTS(vp)) {
+			(void)ubc_msync(vp, (off_t)off, (off_t)(off + len), NULL,
+			    UBC_INVALIDATE);
+		}
+	}
+out:
+	apfs_free(buf, len);
+	return error;
+}
+
+/*
+ * Rename.  VFS has checked the two parents; the bookkeeping is apfs_rename's.  What is left
+ * is the name cache and the vnode: the old name must stop finding it, the new one must.
+ */
+static int
+apfs_vnop_rename(struct vnop_rename_args *ap)
+{
+	vnode_t fdvp = ap->a_fdvp;
+	vnode_t fvp = ap->a_fvp;
+	vnode_t tdvp = ap->a_tdvp;
+	struct apfs_mount *am = APFS_VP_MOUNT(fdvp);
+	struct apfs_node *dn = APFS_VP(fdvp);
+	struct apfs_node *tn = APFS_VP(tdvp);
+	char from[APFS_NAME_BUF], to[APFS_NAME_BUF];
+	int error;
+
+	if (!apfs_writable(am)) {
+		return EROFS;
+	}
+	if (!vnode_isdir(fdvp) || !vnode_isdir(tdvp)) {
+		return ENOTDIR;
+	}
+	if ((error = apfs_name(ap->a_fcnp, from)) != 0 ||
+	    (error = apfs_name(ap->a_tcnp, to)) != 0) {
+		return error;
+	}
+
+	apfs_lock_write(am);
+	/*
+	 * POSIX rename replaces what is there.  The driver's own rename does not (it answers
+	 * EEXIST for a name that is taken), so the entry that is in the way goes first -- a file,
+	 * or a directory that is empty.  Every atomic save in the system does this (a temporary
+	 * file renamed over the one it replaces), and the container manager traps on the error.
+	 */
+	if (ap->a_tvp != NULLVP) {
+		error = vnode_isdir(ap->a_tvp) ?
+		    apfs_rmdir(&am->am_vol, tn->an_id, to, apfs_now()) :
+		    apfs_unlink(&am->am_vol, tn->an_id, to, apfs_now());
+		if (error != 0) {
+			apfs_unlock_write(am);
+			return error;
+		}
+	}
+	error = apfs_rename(&am->am_vol, dn->an_id, from, tn->an_id, to, apfs_now());
+	if (error == 0) {
+		APFS_VP(fvp)->an_parent = tn->an_id;
+	}
+	apfs_unlock_write(am);
+	if (error) {
+		return error;
+	}
+	cache_purge_negatives(fdvp);
+	cache_purge_negatives(tdvp);
+	cache_purge(fvp);
+	cache_enter(tdvp, fvp, ap->a_tcnp);
+	return 0;
+}
+
+static int
+apfs_vnop_setattr(struct vnop_setattr_args *ap)
+{
+	vnode_t vp = ap->a_vp;
+	struct vnode_attr *vap = ap->a_vap;
+	struct apfs_node *an = APFS_VP(vp);
+	struct apfs_mount *am = an->an_mount;
+	struct apfs_setattr sa;
+	int error = 0;
+
+	if (!apfs_writable(am)) {
+		return EROFS;
+	}
+	if (VATTR_IS_ACTIVE(vap, va_data_size)) {
+		if (vnode_isdir(vp)) {
+			return EISDIR;
+		}
+		error = apfs_setlength(vp, (uint64_t)vap->va_data_size);
+		if (error) {
+			return error;
+		}
+	}
+
+	memset(&sa, 0, sizeof(sa));
+	if (VATTR_IS_ACTIVE(vap, va_mode)) {
+		sa.mode_set = true;
+		sa.mode = (uint16_t)((an->an_mode & APFS_S_IFMT) | (vap->va_mode & 07777));
+	}
+	if (VATTR_IS_ACTIVE(vap, va_uid)) {
+		sa.owner_set = true;
+		sa.owner = vap->va_uid;
+	}
+	if (VATTR_IS_ACTIVE(vap, va_gid)) {
+		sa.group_set = true;
+		sa.group = vap->va_gid;
+	}
+	if (VATTR_IS_ACTIVE(vap, va_flags)) {
+		sa.flags_set = true;
+		sa.bsd_flags = vap->va_flags;
+	}
+	if (VATTR_IS_ACTIVE(vap, va_access_time)) {
+		sa.atime_set = true;
+		sa.atime = apfs_ts_ns(vap->va_access_time);
+	}
+	if (VATTR_IS_ACTIVE(vap, va_modify_time)) {
+		sa.mtime_set = true;
+		sa.mtime = apfs_ts_ns(vap->va_modify_time);
+	}
+	if (sa.mode_set || sa.owner_set || sa.group_set || sa.flags_set || sa.atime_set ||
+	    sa.mtime_set) {
+		apfs_lock_write(am);
+		error = apfs_inode_setattr(&am->am_vol, an->an_id, &sa, apfs_now());
+		apfs_unlock_write(am);
+		if (error) {
+			return error;
+		}
+		apfs_node_refresh(am, an);
+	}
+	return error;
+}
+
+static int
+apfs_vnop_setxattr(struct vnop_setxattr_args *ap)
+{
+	vnode_t vp = ap->a_vp;
+	struct apfs_node *an = APFS_VP(vp);
+	struct apfs_mount *am = an->an_mount;
+	size_t len = (size_t)uio_resid(ap->a_uio);
+	char *buf;
+	int error;
+
+	if (!apfs_writable(am)) {
+		return EROFS;
+	}
+	if (len > APFS_XATTR_MAX_EMBEDDED_SIZE) {
+		return E2BIG;
+	}
+	buf = apfs_alloc(len == 0 ? 1 : len);
+	if (buf == NULL) {
+		return ENOMEM;
+	}
+	error = uiomove(buf, len, ap->a_uio);
+	if (error == 0) {
+		apfs_lock_write(am);
+		error = apfs_setxattr(&am->am_vol, an->an_id, ap->a_name, buf, len, 0,
+		    apfs_now());
+		apfs_unlock_write(am);
+	}
+	apfs_free(buf, len == 0 ? 1 : len);
+	return error;
+}
+
+static int
+apfs_vnop_removexattr(struct vnop_removexattr_args *ap)
+{
+	vnode_t vp = ap->a_vp;
+	struct apfs_node *an = APFS_VP(vp);
+	struct apfs_mount *am = an->an_mount;
+	int error;
+
+	if (!apfs_writable(am)) {
+		return EROFS;
+	}
+	apfs_lock_write(am);
+	error = apfs_removexattr(&am->am_vol, an->an_id, ap->a_name, apfs_now());
+	apfs_unlock_write(am);
+	return error;
 }
 
 /* ------------------------------------------------------------------ attributes */
@@ -366,8 +1151,8 @@ apfs_vnop_getattr(struct vnop_getattr_args *ap)
 	size = an->an_size;
 
 	VATTR_RETURN(vap, va_rdev, (dev_t)ino.rdev);
-	VATTR_RETURN(vap, va_nlink, vnode_isdir(vp) ? 2 : (uint32_t)(ino.nchildren > 0
-	    ? ino.nchildren : 1));
+	VATTR_RETURN(vap, va_nlink, vnode_isdir(vp) ? 2 : (an->an_unlinked ? 0 :
+	    (uint32_t)(ino.nchildren > 0 ? ino.nchildren : 1)));
 	VATTR_RETURN(vap, va_data_size, size);
 	VATTR_RETURN(vap, va_total_size, size);
 	VATTR_RETURN(vap, va_total_alloc, ino.alloced_size);
@@ -707,6 +1492,60 @@ apfs_vnop_read(struct vnop_read_args *ap)
 	os_atomic_add(&am->am_read_bytes, before - (uint64_t)uio_resid(uio), relaxed);
 	os_atomic_add(&am->am_read_cached, cached, relaxed);
 	os_atomic_add(&am->am_read_filled, filled, relaxed);
+	return error;
+}
+
+
+/*
+ * Page out.  A writable shared mapping leaves its pages dirty in the page cache; before
+ * they can go (a msync, the end of a mapping, memory pressure), they come here and are
+ * written into the file's extents.  The slow in-place path is the right one: it never
+ * changes a structure, and a mapping cannot write past the end of the file.
+ */
+static int
+apfs_vnop_pageout(struct vnop_pageout_args *ap)
+{
+	vnode_t vp = ap->a_vp;
+	struct apfs_node *an = APFS_VP(vp);
+	struct apfs_mount *am = an->an_mount;
+	upl_t upl = ap->a_pl;
+	upl_offset_t upl_offset = ap->a_pl_offset;
+	off_t offset = ap->a_f_offset;
+	size_t size = ap->a_size;
+	vm_offset_t address = 0;
+	uint64_t old = an->an_size;
+	int error = 0;
+
+	if (upl == NULL || size == 0) {
+		error = EINVAL;
+	} else if (ubc_upl_map(upl, &address) != KERN_SUCCESS) {
+		error = ENOMEM;
+	} else {
+		size_t len = size;
+
+		if ((uint64_t)offset < old) {
+			if ((uint64_t)len > old - (uint64_t)offset) {
+				len = (size_t)(old - (uint64_t)offset);
+			}
+			apfs_lock_write(am);
+			error = apfs_write_data(&am->am_vol, an->an_id, (uint64_t)offset,
+			    (const uint8_t *)address + upl_offset, len, apfs_now());
+			apfs_unlock_write(am);
+			if (error == 0) {
+				apfs_node_refresh(am, an);
+			}
+		}
+		ubc_upl_unmap(upl);
+	}
+	if (!(ap->a_flags & UPL_NOCOMMIT)) {
+		if (error) {
+			ubc_upl_abort_range(upl, upl_offset, (upl_size_t)size,
+			    UPL_ABORT_FREE_ON_EMPTY | UPL_ABORT_ERROR);
+		} else {
+			ubc_upl_commit_range(upl, upl_offset, (upl_size_t)size,
+			    UPL_COMMIT_CLEAR_DIRTY | UPL_COMMIT_FREE_ON_EMPTY);
+		}
+	}
 	return error;
 }
 
@@ -1103,7 +1942,8 @@ apfs_vnop_listxattr(struct vnop_listxattr_args *ap)
 static int
 apfs_vnop_open(struct vnop_open_args *ap)
 {
-	if (ap->a_mode & (FWRITE | O_TRUNC | O_CREAT)) {
+	if ((ap->a_mode & (FWRITE | O_TRUNC | O_CREAT)) &&
+	    !apfs_writable(APFS_VP_MOUNT(ap->a_vp))) {
 		return EROFS;
 	}
 	return 0;
@@ -1148,6 +1988,15 @@ apfs_vnop_inactive(struct vnop_inactive_args *ap)
 	if (an == NULL) {
 		return 0;
 	}
+	/* the last close of a file whose last name is long gone: now it goes for good */
+	if (an->an_unlinked) {
+		struct apfs_mount *am = an->an_mount;
+
+		apfs_lock_write(am);
+		(void)apfs_delete_inode(&am->am_vol, an->an_id, apfs_now());
+		apfs_unlock_write(am);
+		an->an_unlinked = false;
+	}
 	/*
 	 * Most files hold nothing to give back (a directory, a link, a file not compressed): then
 	 * not even the lock. Looked at without it: a state being set up meanwhile is given back with
@@ -1191,6 +2040,18 @@ apfs_vnop_reclaim(struct vnop_reclaim_args *ap)
  * does not have that"; the default, ENOTSUP, is not -- the iOS dyld, probing the root
  * volume for APFS features, gives up on it.
  */
+/*
+ * Advisory record locks (fcntl/F_SETLK, flock).  The kernel keeps the records on the
+ * vnode itself, so this is the kernel's own manager: securityd locks the keychain
+ * databases, iconservicesagent its caches, and without this every one of them either
+ * leaves with an error or aborts before the splash screen is taken down.
+ */
+static int
+apfs_vnop_advlock(struct vnop_advlock_args *ap)
+{
+	return lf_advlock(ap);
+}
+
 static int
 apfs_vnop_ioctl(__unused struct vnop_ioctl_args *ap)
 {
@@ -1237,7 +2098,20 @@ int(**apfs_vnodeop_p)(void *);
 const struct vnodeopv_entry_desc apfs_vnodeop_entries[] = {
 	{ .opve_op = &vnop_default_desc, .opve_impl = (VOPFUNC)vn_default_error },
 	{ .opve_op = &vnop_ioctl_desc, .opve_impl = (VOPFUNC)apfs_vnop_ioctl },
+	{ .opve_op = &vnop_advlock_desc, .opve_impl = (VOPFUNC)apfs_vnop_advlock },
 	{ .opve_op = &vnop_lookup_desc, .opve_impl = (VOPFUNC)apfs_vnop_lookup },
+	{ .opve_op = &vnop_create_desc, .opve_impl = (VOPFUNC)apfs_vnop_create },
+	{ .opve_op = &vnop_mkdir_desc, .opve_impl = (VOPFUNC)apfs_vnop_mkdir },
+	{ .opve_op = &vnop_mknod_desc, .opve_impl = (VOPFUNC)apfs_vnop_mknod },
+	{ .opve_op = &vnop_remove_desc, .opve_impl = (VOPFUNC)apfs_vnop_remove },
+	{ .opve_op = &vnop_rmdir_desc, .opve_impl = (VOPFUNC)apfs_vnop_rmdir },
+	{ .opve_op = &vnop_rename_desc, .opve_impl = (VOPFUNC)apfs_vnop_rename },
+	{ .opve_op = &vnop_link_desc, .opve_impl = (VOPFUNC)apfs_vnop_link },
+	{ .opve_op = &vnop_symlink_desc, .opve_impl = (VOPFUNC)apfs_vnop_symlink },
+	{ .opve_op = &vnop_setattr_desc, .opve_impl = (VOPFUNC)apfs_vnop_setattr },
+	{ .opve_op = &vnop_write_desc, .opve_impl = (VOPFUNC)apfs_vnop_write },
+	{ .opve_op = &vnop_setxattr_desc, .opve_impl = (VOPFUNC)apfs_vnop_setxattr },
+	{ .opve_op = &vnop_removexattr_desc, .opve_impl = (VOPFUNC)apfs_vnop_removexattr },
 	{ .opve_op = &vnop_open_desc, .opve_impl = (VOPFUNC)apfs_vnop_open },
 	{ .opve_op = &vnop_close_desc, .opve_impl = (VOPFUNC)apfs_vnop_close },
 	{ .opve_op = &vnop_getattr_desc, .opve_impl = (VOPFUNC)apfs_vnop_getattr },
@@ -1253,6 +2127,7 @@ const struct vnodeopv_entry_desc apfs_vnodeop_entries[] = {
 	{ .opve_op = &vnop_mmap_desc, .opve_impl = (VOPFUNC)apfs_vnop_mmap },
 	{ .opve_op = &vnop_mnomap_desc, .opve_impl = (VOPFUNC)apfs_vnop_mnomap },
 	{ .opve_op = &vnop_pagein_desc, .opve_impl = (VOPFUNC)apfs_vnop_pagein },
+	{ .opve_op = &vnop_pageout_desc, .opve_impl = (VOPFUNC)apfs_vnop_pageout },
 	{ .opve_op = (struct vnodeop_desc *)NULL, .opve_impl = (VOPFUNC)NULL }
 };
 const struct vnodeopv_desc apfs_vnodeop_opv_desc = {

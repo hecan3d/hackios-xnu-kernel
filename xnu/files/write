@@ -1,0 +1,15 @@
+bsd/miscfs/apfs/apfs_txn.c:181:	if (nx->dev.write == NULL || nx->sb == NULL) {
+bsd/miscfs/apfs/apfs_txn.c:723:		error = nx->dev.write(nx->dev.ctx, at, txn->pend[i].data, bs);
+bsd/miscfs/apfs/apfs_txn.c:1087:	if (nx->dev.write == NULL) {
+bsd/miscfs/apfs/apfs_write.h:19:	uint64_t    calls;              /* calls to dev.write */
+bsd/miscfs/apfs/apfs_lib.c:1177:	if (dev->write != NULL) {
+bsd/miscfs/apfs/apfs_vfsops.c:144:apfs_dev_write(void *ctx, uint64_t off, const void *buf, size_t len)
+bsd/miscfs/apfs/apfs_vfsops.c:1211:		dev.write = apfs_dev_write;
+bsd/miscfs/apfs/apfs_vfsops.c:1316:		    dev.write != NULL, (unsigned)vfs_flags(mp),
+bsd/miscfs/apfs/apfs_vfsops.c:1320:		if (dev.write != NULL && !writable) {
+bsd/miscfs/apfs/apfs_write.c:83: *   the device cannot write                 dev.write is NULL, as it is at every mount
+bsd/miscfs/apfs/apfs_write.c:134:	if (vol->nx->dev.write == NULL) {
+bsd/miscfs/apfs/apfs_write.c:258:	error = nx->dev.write(nx->dev.ctx, at, data, nx->block_size);
+bsd/miscfs/apfs/apfs_fs_write.c:1784:	if (vol->nx->dev.write == NULL) {
+bsd/miscfs/apfs/apfs_fs_write.c:1785:		apfs_why_append("fs_run: no dev.write");
+bsd/miscfs/apfs/apfs_fs_write.c:1796:	    vol->nx->dev.write != NULL, (int)((vol->incompat & APFS_INCOMPAT_SEALED_VOLUME) != 0),

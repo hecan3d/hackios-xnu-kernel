@@ -212,11 +212,13 @@ osm_start(void)
 {
 	thread_t thread;
 	uint32_t mode = 1;
+	uint32_t cap_mhz = 0;
 	const ml_topology_info_t *topology = ml_get_topology_info();
 	static const unsigned domain_cpus[3] = { 4, 3, 1 };
 	unsigned owned[3] = { 0 };
 
 	PE_parse_boot_argn("cpufreq", &mode, sizeof(mode));
+	PE_parse_boot_argn("cpu_cap", &cap_mhz, sizeof(cap_mhz));
 	simple_lock_init(&osm_lock, 0);
 	for (unsigned i = 0; i < topology->num_cpus; i++) {
 		owned[domain_of(topology->cpus[i].phys_id)]++;
@@ -238,6 +240,25 @@ osm_start(void)
 		if (!osm_lut(words, osm_khz[d], &osm_low[d], &osm_high[d])) {
 			tell("cpufreq: OSM group %u has no valid frequency table\n", d);
 			continue;
+		}
+		if (cap_mhz != 0) {
+			uint32_t best = 0;
+			bool found = false;
+
+			for (unsigned r = 0; r < 40; r++) {
+				if (osm_khz[d][r] != 0 && osm_khz[d][r] / 1000 <= cap_mhz) {
+					best = r;
+					found = true;
+				}
+			}
+			if (found && best < osm_high[d]) {
+				tell("cpufreq: cpu_cap %u MHz: group %u top %u -> %u (%u MHz)\n",
+				    cap_mhz, d, osm_high[d], best, osm_khz[d][best] / 1000);
+				osm_high[d] = best;
+				if (osm_low[d] > osm_high[d]) {
+					osm_low[d] = osm_high[d];
+				}
+			}
 		}
 		/* A firmware-owned core's load (notably the USB loader) is absent from XNU's counters. */
 		if (mode == 2 || owned[d] != domain_cpus[d]) {

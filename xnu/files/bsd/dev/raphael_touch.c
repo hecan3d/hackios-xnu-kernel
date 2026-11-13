@@ -350,12 +350,14 @@ touch_report(uint32_t mask, const int *x, const int *y)
 			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
 				hakios_touch_post(st.active & bit ? HAKIOS_TOUCH_MOVE : HAKIOS_TOUCH_DOWN, id,
 				    (uint32_t)x[id] * 65535u / 1079u, (uint32_t)y[id] * 65535u / 2339u);
+				printf("raphael-touch: finger %u %s at (%d, %d)\n", id, (st.active & bit) ? "MOVE" : "DOWN", x[id], y[id]);
 			}
 			st.x[id] = x[id];
 			st.y[id] = y[id];
 		} else if (st.active & bit) {
 			hakios_touch_post(HAKIOS_TOUCH_UP, id,
 			    (uint32_t)st.x[id] * 65535u / 1079u, (uint32_t)st.y[id] * 65535u / 2339u);
+			printf("raphael-touch: finger %u UP\n", id);
 		}
 	}
 	st.active = mask;
@@ -378,13 +380,12 @@ touch_normandy_probe(void)
 			return EIO;
 		}
 		touch_wait(10);
-		if (!touch_read(0x5d, 0x3100, true, &awake, 1) && awake == 0xbb) {
+		if (!touch_read(0x5d, 0x3100, true, &awake, 1) && (awake == 0xbb || awake == 0xaa)) {
 			break;
 		}
 	}
-	if (awake != 0xbb) {
-		printf("raphael-touch: Normandy doze handshake failed status=%#x\n", awake);
-		return ETIMEDOUT;
+	if (awake != 0xbb && awake != 0xaa) {
+		printf("raphael-touch: Normandy doze handshake warning status=%#x\n", awake);
 	}
 	int err = touch_read(0x5d, NORMANDY_PID, true, pid, sizeof(pid));
 	if (!err) {
@@ -392,8 +393,22 @@ touch_normandy_probe(void)
 	}
 	printf("raphael-touch: Normandy pid=%02x%02x%02x%02x sensor=%u err=%d\n",
 	    pid[0], pid[1], pid[2], pid[3], sensor, err);
-	if (err || memcmp(pid, "9886", sizeof(pid)) || (sensor & 15u) > 1u) {
+	uint8_t dump[32] = {0};
+	(void)touch_read(0x5d, 0x4530, true, dump, sizeof(dump));
+	printf("raphael-touch: dump 0x4530:");
+	for (int i = 0; i < 32; i++) printf(" %02x", dump[i]);
+	printf("\n");
+	if (err) {
+		printf("raphael-touch: read failed, err=%d\n", err);
 		return ENODEV;
+	}
+	if (memcmp(pid, "9886", sizeof(pid))) {
+		printf("raphael-touch: non-standard pid %02x%02x%02x%02x, continuing anyway\n",
+		    pid[0], pid[1], pid[2], pid[3]);
+	}
+	if ((sensor & 15u) > 1u) {
+		printf("raphael-touch: unexpected sensor=%u, defaulting to unmirrored\n", sensor);
+		sensor = 1;
 	}
 	/* Sensor0's board profile mirrors both axes; sensor1 is unmirrored. */
 	st.invert = (sensor & 15u) == 0;

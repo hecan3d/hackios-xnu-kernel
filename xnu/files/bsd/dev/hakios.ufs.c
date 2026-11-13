@@ -209,6 +209,28 @@ static bool ufs_write_out, ufs_write_was_native;        /* the list is out for w
 static uint64_t ufs_writes, ufs_write_bytes, ufs_write_errors, ufs_write_refused;
 
 SYSCTL_DECL(_kern_hakios);
+
+extern void loader_log_reset(void);
+
+/* Writing anything to it throws the kernel's log away (see init: the tail is what USB brings). */
+static int
+hakios_klog_reset SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int one = 0;
+
+	if (req->newptr == USER_ADDR_NULL) {
+		return SYSCTL_OUT(req, "", 1);
+	}
+	if (req->newlen != 0 && SYSCTL_IN(req, &one, sizeof(one)) != 0) {
+		return EINVAL;
+	}
+	loader_log_reset();
+	return 0;
+}
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, klog_reset, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_LOCKED,
+    0, 0, hakios_klog_reset, "I", "write to throw the kernel's log away");
 SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_requests, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_requests,
     "requests the phone's storage has answered through the loader");
 SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_errors,
@@ -440,6 +462,8 @@ ufs_part_bytes(uint32_t part)
 	return ufs_page->part[part].blocks * ufs_page->part[part].block_size;
 }
 
+static int ufs_read_native(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len);
+
 /*
  * Bytes [offset, offset + len) of partition part into dst, whatever their alignment, through the
  * loader: the native blocks that cover them are read a buffer at a time and the wanted bytes
@@ -451,6 +475,7 @@ ufs_read_mailbox(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 	uint64_t nbs = ufs_page->part[part].block_size, per = ufs_buffer_size / nbs;
 	static uint8_t *bounce;
 	int error = 0;
+	int native_retried = 0;
 
 	if (bounce == NULL) {
 		bounce = kalloc_data(ufs_buffer_size, Z_WAITOK);
@@ -458,7 +483,21 @@ ufs_read_mailbox(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 			return ENOMEM;
 		}
 	}
-	lck_mtx_lock(&ufs_lock);
+	while (native_retried < 50) {
+		lck_mtx_lock(&ufs_lock);
+		if (!ufshc_list_in()) {
+			break;
+		}
+		lck_mtx_unlock(&ufs_lock);
+		if (ufs_lun[part] != 0xff && ufs_read_native(part, offset, dst, len) == 0) {
+			return 0;
+		}
+		IOSleep(2);
+		native_retried++;
+	}
+	if (native_retried == 50) {
+		lck_mtx_lock(&ufs_lock);
+	}
 	if (ufshc_list_in()) {
 		/* this kernel's own transfer list is in the controller: UEFI's driver must not be asked to ring */
 		if (ufs_mailbox_refused++ < 4) {
@@ -695,11 +734,6 @@ ufs_strategy(buf_t bp)
 		buf_biodone(bp);
 		return;
 	}
-	if (!(buf_flags(bp) & B_READ)) {
-		buf_seterror(bp, EROFS);         /* this device never writes */
-		buf_biodone(bp);
-		return;
-	}
 	size = ufs_part_bytes(part);
 	offset = (uint64_t)buf_blkno(bp) * ufs_bsize[part];
 	len = buf_count(bp);
@@ -711,6 +745,29 @@ ufs_strategy(buf_t bp)
 	}
 	if (offset + len > size) {
 		len = size - offset;
+	}
+	if (!(buf_flags(bp) & B_READ)) {
+		/*
+		 * The one partition the data volume lives in, when ufs_write=1: a filesystem mounted
+		 * from it may write, and this is the path its commits take.  ufs_write() keeps the
+		 * window past UFS_WRITE_FIRST and the partition's identity; the loader reads every
+		 * block back before it answers, so a "no error" here means the flash has it.  The
+		 * controller's own transfer list goes back in at once: the next read is a read.
+		 */
+		if (ufs_write_part < 0 || part != (uint32_t)ufs_write_part) {
+			ufs_write_refused++;
+			buf_seterror(bp, EROFS);         /* every other partition never writes */
+			buf_biodone(bp);
+			return;
+		}
+		error = ufs_write(part, offset, (const uint8_t *)buf_dataptr(bp), len);
+		ufs_write_restore();
+		if (error) {
+			buf_seterror(bp, error);
+		}
+		buf_setresid(bp, 0);
+		buf_biodone(bp);
+		return;
 	}
 	error = ufs_read(part, offset, (uint8_t *)buf_dataptr(bp), len);
 	buf_setresid(bp, (uint32_t)(buf_count(bp) - (error ? 0 : len)));

@@ -26,7 +26,9 @@ extern char *proc_name_address(struct proc *p);
 
 void user_exception_trace(exception_type_t exception, mach_exception_data_t code, mach_msg_type_number_t count, thread_t thread);
 
-static TUNABLE(uint32_t, user_exception_trace_enabled, "systrace", 0);
+/* (on by default for now: the container manager traps with SIGILL and our signal handler in the
+   process never says a word about it; the kernel's own trace is the only backtrace there is) */
+static TUNABLE(uint32_t, user_exception_trace_enabled, "systrace", 1);
 
 static bool
 plausible_user_address(uint64_t address)
@@ -45,6 +47,12 @@ user_exception_trace(exception_type_t exception, mach_exception_data_t code, mac
 	task_t task;
 	struct proc *proc;
 
+	static bool said;
+	if (!said) {
+		said = true;
+		printf("user_exception_trace: enabled %u, first call exception %d thread %p current %p\n",
+		    user_exception_trace_enabled, exception, thread, current_thread());
+	}
 	if (!user_exception_trace_enabled || thread != current_thread()) {
 		return;
 	}

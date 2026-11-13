@@ -62,7 +62,7 @@ index a4d25040f38f..aad72993d139 100644
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..f850e6a55a77 100644
+index 44274016a4cf..7e8800fd8683 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
 @@ -109,6 +109,43 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
@@ -109,13 +109,16 @@ index 44274016a4cf..f850e6a55a77 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +192,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +192,17 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
 +bsd/miscfs/apfs/apfs_deflate.c		optional apfs
 +bsd/miscfs/apfs/apfs_zbitmap.c		optional apfs
 +bsd/miscfs/apfs/apfs_lib.c		optional apfs
++bsd/miscfs/apfs/apfs_txn.c		optional apfs
++bsd/miscfs/apfs/apfs_btree_write.c		optional apfs
++bsd/miscfs/apfs/apfs_fs_write.c		optional apfs
 +bsd/miscfs/apfs/apfs_write.c		optional apfs
 +bsd/miscfs/apfs/apfs_store.c		optional apfs
 +bsd/miscfs/apfs/apfs_vfsops.c		optional apfs
@@ -124,7 +127,7 @@ index 44274016a4cf..f850e6a55a77 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +406,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +409,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -132,7 +135,7 @@ index 44274016a4cf..f850e6a55a77 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +429,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +432,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -1098,6 +1101,32 @@ index 74a2036cf69e..a68b79ce48fa 100644
  
  #define UIO_IS_USER_SPACE32( a_uio_t )  \
  	( (a_uio_t)->uio_segflg == UIO_USERSPACE32 || (a_uio_t)->uio_segflg == UIO_PHYS_USERSPACE32 || \
+diff --git a/bsd/uxkern/ux_exception.c b/bsd/uxkern/ux_exception.c
+index 1780c2a20b36..320cac6bb149 100644
+--- a/bsd/uxkern/ux_exception.c
++++ b/bsd/uxkern/ux_exception.c
+@@ -127,6 +127,21 @@ handle_ux_exception(thread_t                    thread,
+ 	/* Translate exception and code to signal type */
+ 	int ux_signal = ux_exception(exception, code, subcode);
+ 
++	/*
++	 * The port's own trace of a user exception (osfmk/arm64/user_exception_trace.c) is not
++	 * reached from the arm64 exception handler here, so it is called from the one place every
++	 * user trap goes through: it prints the process, the pc/lr and a walk of the frame
++	 * pointers.  Without it a daemon that traps says nothing at all -- the container manager
++	 * loses eleven processes a run that way.
++	 */
++	{
++		extern void user_exception_trace(int exception, mach_exception_data_t code,
++		    mach_msg_type_number_t count, thread_t thread);
++		mach_exception_data_type_t one[2] = { (mach_exception_data_type_t)code,
++			                              (mach_exception_data_type_t)subcode };
++		user_exception_trace(exception, one, 2, thread);
++	}
++
+ 	uthread_t ut = get_bsdthread_info(thread);
+ 
+ 	/*
 diff --git a/bsd/vfs/vfs_attrlist.c b/bsd/vfs/vfs_attrlist.c
 index cbaa0b221894..78315a2d54cf 100644
 --- a/bsd/vfs/vfs_attrlist.c
@@ -1147,6 +1176,104 @@ index cbaa0b221894..78315a2d54cf 100644
  	kauth_action_t action;
  	int eofflag;
  	uint64_t options;
+diff --git a/bsd/vfs/vfs_cache.c b/bsd/vfs/vfs_cache.c
+index 1a9c2fa3f59e..fd9c48832a06 100644
+--- a/bsd/vfs/vfs_cache.c
++++ b/bsd/vfs/vfs_cache.c
+@@ -82,6 +82,8 @@
+ #include <sys/kauth.h>
+ #include <sys/user.h>
+ #include <sys/paths.h>
++#include <sys/proc.h>
++#include <kern/clock.h>
+ #include <os/overflow.h>
+ 
+ #if CONFIG_MACF
+@@ -2968,13 +2970,76 @@ name_cache_lock_shared(void)
+ 	NC_SMR_STATS(nc_lock_shared);
+ }
+ 
++/*
++ * Who holds the name cache in exclusive mode.  lck_rw's exclusive wait is not interruptible,
++ * so a lookup that never gets it waits forever and nothing in the statistics says where.  The
++ * APFS watchdog calls vfs_cache_wd_report() and this names the process if the wait is long.
++ */
++static struct {
++	thread_t   th;
++	uint64_t   since;
++	char       name[MAXCOMLEN + 1];
++} namecache_wd;
++static LCK_SPIN_DECLARE(namecache_wd_lock, &namecache_lck_grp);
++
++static void
++name_cache_wd_take(void)
++{
++	lck_spin_lock(&namecache_wd_lock);
++	namecache_wd.th = current_thread();
++	namecache_wd.since = mach_absolute_time();
++	proc_selfname(namecache_wd.name, sizeof(namecache_wd.name));
++	lck_spin_unlock(&namecache_wd_lock);
++}
++
++static void
++name_cache_wd_drop(void)
++{
++	lck_spin_lock(&namecache_wd_lock);
++	if (namecache_wd.th == current_thread()) {
++		namecache_wd.th = NULL;
++		namecache_wd.since = 0;
++	}
++	lck_spin_unlock(&namecache_wd_lock);
++}
++
+ void
+ name_cache_lock(void)
+ {
+ 	lck_rw_lock_exclusive(&namecache_rw_lock);
++	name_cache_wd_take();
+ 	NC_SMR_STATS(nc_lock);
+ }
+ 
++/* The name cache held in exclusive mode for over five seconds, straight to the log */
++void
++vfs_cache_wd_report(void)
++{
++	uint64_t now = mach_absolute_time(), slow = 0, age, ns;
++	thread_t th;
++	char name[MAXCOMLEN + 1];
++	uint32_t tid;
++
++	nanoseconds_to_absolutetime(5ULL * NSEC_PER_SEC, &slow);
++	lck_spin_lock(&namecache_wd_lock);
++	th = namecache_wd.th;
++	age = th != NULL ? now - namecache_wd.since : 0;
++	strlcpy(name, namecache_wd.name, sizeof(name));
++	lck_spin_unlock(&namecache_wd_lock);
++	if (th == NULL || age < slow) {
++		return;
++	}
++	/* (it may be a wait msleep let go of: the shared mode can be taken when it is free) */
++	if (lck_rw_try_lock_shared(&namecache_rw_lock)) {
++		lck_rw_done(&namecache_rw_lock);
++		return;
++	}
++	absolutetime_to_nanoseconds(age, &ns);
++	tid = thread_tid(th);
++	printf("apfs: wd: the name cache held exclusively by %s[thread %u] for %llu ms\n", name, tid,
++	    (unsigned long long)(ns / 1000000));
++}
++
+ boolean_t
+ name_cache_lock_shared_to_exclusive(void)
+ {
+@@ -2984,6 +3049,7 @@ name_cache_lock_shared_to_exclusive(void)
+ void
+ name_cache_unlock(void)
+ {
++	name_cache_wd_drop();
+ 	lck_rw_done(&namecache_rw_lock);
+ }
+ 
 diff --git a/bsd/vfs/vfs_conf.c b/bsd/vfs/vfs_conf.c
 index bae70cda3a96..031613b10643 100644
 --- a/bsd/vfs/vfs_conf.c
@@ -1262,10 +1389,18 @@ index bae70cda3a96..031613b10643 100644
  	NULL
  };
 diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
-index a05c8e767b33..5f2846cb8893 100644
+index a05c8e767b33..771569e9566f 100644
 --- a/bsd/vfs/vfs_lookup.c
 +++ b/bsd/vfs/vfs_lookup.c
-@@ -1670,7 +1670,7 @@ lookup_handle_symlink(struct nameidata *ndp, vnode_t *new_dp, bool *new_dp_has_i
+@@ -77,6 +77,7 @@
+ #include <sys/syslimits.h>
+ #include <sys/time.h>
+ #include <sys/namei.h>
++extern char apfs_mount_why[1024];
+ #include <sys/vm.h>
+ #include <sys/vnode_internal.h>
+ #include <sys/mount_internal.h>
+@@ -1670,7 +1671,7 @@ lookup_handle_symlink(struct nameidata *ndp, vnode_t *new_dp, bool *new_dp_has_i
  	int error;
  	char *cp;               /* pointer into pathname argument */
  	uio_t auio;
@@ -1315,10 +1450,183 @@ index d0476214e5f0..c81cadfab1d4 100644
  	if (dq->dq_id == 0) {
  		dq->dq_flags &= ~DQ_MOD;
 diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
-index f64d8c647365..f2e13c1aa7f3 100644
+index f64d8c647365..49ea69b532d8 100644
 --- a/bsd/vfs/vfs_subr.c
 +++ b/bsd/vfs/vfs_subr.c
-@@ -10995,7 +10995,7 @@ rmdir_remove_orphaned_appleDouble(vnode_t vp, vfs_context_t ctx, int * restart_f
+@@ -88,6 +88,7 @@
+ #include <sys/vnode_internal.h>
+ #include <sys/stat.h>
+ #include <sys/namei.h>
++extern char apfs_mount_why[1024];
+ #include <sys/ucred.h>
+ #include <sys/buf_internal.h>
+ #include <sys/errno.h>
+@@ -5816,21 +5817,164 @@ done:
+ 	return 0;
+ }
+ 
++/*
++ * Who holds which vnode lock.  The lock is a mutex in this port, so a thread waiting for one
++ * that is never let go of waits forever and cannot be interrupted -- and a stuck lookup, open
++ * or stat then says nothing about where it is.  The APFS watchdog (apfs_watchdog_call) calls
++ * vfs_vnode_wd_report() and this names the vnode and the process holding it.
++ */
++#define VNODE_WD_SLOTS  64
++#define VNODE_WD_NAMED  8
++struct vnode_wd_slot {
++	vnode_t    vp;
++	thread_t   th;
++	uint64_t   since;
++	char       name[MAXCOMLEN + 1];
++};
++static struct vnode_wd_slot vnode_wd[VNODE_WD_SLOTS];
++static LCK_SPIN_DECLARE(vnode_wd_lock, &vnode_lck_grp);
++/* holdings already named in the log, so a stuck one is named once and not every tick */
++static struct {
++	vnode_t    vp;
++	uint64_t   since;
++} vnode_wd_said[VNODE_WD_NAMED];
++
++static void
++vnode_wd_take(vnode_t vp)
++{
++	unsigned i, slot = VNODE_WD_SLOTS;
++
++	lck_spin_lock(&vnode_wd_lock);
++	for (i = 0; i < VNODE_WD_SLOTS; i++) {
++		if (vnode_wd[i].vp == vp) {
++			slot = i;               /* (taken again: the newest one stands) */
++			break;
++		}
++		if (slot == VNODE_WD_SLOTS && vnode_wd[i].vp == NULL) {
++			slot = i;
++		}
++	}
++	if (slot < VNODE_WD_SLOTS) {
++		vnode_wd[slot].vp = vp;
++		vnode_wd[slot].th = current_thread();
++		vnode_wd[slot].since = mach_absolute_time();
++		proc_selfname(vnode_wd[slot].name, sizeof(vnode_wd[slot].name));
++	}
++	lck_spin_unlock(&vnode_wd_lock);
++}
++
++static void
++vnode_wd_drop(vnode_t vp)
++{
++	unsigned i;
++
++	lck_spin_lock(&vnode_wd_lock);
++	for (i = 0; i < VNODE_WD_SLOTS; i++) {
++		if (vnode_wd[i].vp == vp) {
++			vnode_wd[i].vp = NULL;
++			break;
++		}
++	}
++	lck_spin_unlock(&vnode_wd_lock);
++}
++
++/* The vnode locks held for longer than five seconds, straight to the log */
++void
++vfs_vnode_wd_report(void)
++{
++	uint64_t now = mach_absolute_time(), slow = 0;
++	struct {
++		vnode_t   vp;
++		uint64_t  since;
++		uint64_t  ms;
++		uint32_t  tid;
++		char      name[MAXCOMLEN + 1];
++	} held[VNODE_WD_NAMED];
++	unsigned n = 0, i;
++
++	nanoseconds_to_absolutetime(5ULL * NSEC_PER_SEC, &slow);
++	lck_spin_lock(&vnode_wd_lock);
++	for (i = 0; i < VNODE_WD_SLOTS && n < VNODE_WD_NAMED; i++) {
++		uint64_t age, ns;
++
++		if (vnode_wd[i].vp == NULL) {
++			continue;
++		}
++		age = now - vnode_wd[i].since;
++		if (age < slow) {
++			continue;
++		}
++		absolutetime_to_nanoseconds(age, &ns);
++		held[n].vp = vnode_wd[i].vp;
++		held[n].since = vnode_wd[i].since;
++		held[n].ms = ns / 1000000;
++		held[n].tid = thread_tid(vnode_wd[i].th);
++		strlcpy(held[n].name, vnode_wd[i].name, sizeof(held[n].name));
++		n++;
++	}
++	lck_spin_unlock(&vnode_wd_lock);
++	for (i = 0; i < n; i++) {
++		unsigned k;
++		bool said = false;
++
++		/*
++		 * A lock msleep let go of in the middle of a wait (vnode_drain, vflush) is still
++		 * in the table: take the vnode's lock to tell, and say nothing of a free one.
++		 */
++		if (lck_mtx_try_lock(&held[i].vp->v_lock)) {
++			lck_mtx_unlock(&held[i].vp->v_lock);
++			for (k = 0; k < VNODE_WD_NAMED; k++) {
++				if (vnode_wd_said[k].vp == held[i].vp) {
++					vnode_wd_said[k].vp = NULL;
++				}
++			}
++			continue;
++		}
++		/* (once per holding, not once per tick) */
++		for (k = 0; k < VNODE_WD_NAMED; k++) {
++			if (vnode_wd_said[k].vp == held[i].vp &&
++			    vnode_wd_said[k].since == held[i].since) {
++				said = true;
++				break;
++			}
++		}
++		if (said) {
++			continue;
++		}
++		for (k = 0; k < VNODE_WD_NAMED; k++) {
++			if (vnode_wd_said[k].vp == NULL) {
++				vnode_wd_said[k].vp = held[i].vp;
++				vnode_wd_said[k].since = held[i].since;
++				break;
++			}
++		}
++		/* (the vnode cannot go away: its lock is held, so it has a use) */
++		printf("apfs: wd: vnode %p (id %u, type %u, tag %u, usecount %d, name %s) locked by"
++		    " %s[thread %u] for %llu ms\n", held[i].vp, held[i].vp->v_id, held[i].vp->v_type,
++		    held[i].vp->v_tag, held[i].vp->v_usecount,
++		    held[i].vp->v_name != NULL ? held[i].vp->v_name : "-", held[i].name, held[i].tid,
++		    (unsigned long long)held[i].ms);
++	}
++}
++
+ void
+ vnode_lock(vnode_t vp)
+ {
+ 	lck_mtx_lock(&vp->v_lock);
++	vnode_wd_take(vp);
+ }
+ 
+ void
+ vnode_lock_spin(vnode_t vp)
+ {
+ 	lck_mtx_lock_spin(&vp->v_lock);
++	vnode_wd_take(vp);
+ }
+ 
+ void
+ vnode_unlock(vnode_t vp)
+ {
++	vnode_wd_drop(vp);
+ 	lck_mtx_unlock(&vp->v_lock);
+ }
+ 
+@@ -10995,7 +11139,7 @@ rmdir_remove_orphaned_appleDouble(vnode_t vp, vfs_context_t ctx, int * restart_f
  	uio_t auio = NULL;
  	int eofflag, siz = UIO_BUFF_SIZE, alloc_size = 0, nentries = 0;
  	int open_flag = 0, full_erase_flag = 0;
@@ -1328,10 +1636,100 @@ index f64d8c647365..f2e13c1aa7f3 100644
  	void *dir_pos;
  	void *dir_end;
 diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
-index 2bbba037c2dd..ee65d5943196 100644
+index 2bbba037c2dd..c20f2a0127be 100644
 --- a/bsd/vfs/vfs_syscalls.c
 +++ b/bsd/vfs/vfs_syscalls.c
-@@ -7261,7 +7261,7 @@ readlinkat_internal(vfs_context_t ctx, int fd, vnode_t lnk_vp, user_addr_t path,
+@@ -3405,6 +3405,71 @@ quotactl(__unused proc_t p, __unused struct quotactl_args *uap, __unused int32_t
+ }
+ #endif /* QUOTA */
+ 
++/*
++ * The statfs layout iOS userland reads.
++ *
++ * munge_statfs() fills struct user64_statfs, the LP64 layout that starts with f_otype and
++ * f_oflags (what macOS read before 64-bit inodes).  An arm64 iOS program does not use it: its
++ * struct statfs is __DARWIN_STRUCT_STATFS64 -- f_bsize first, f_blocks at offset 8, and the type
++ * names far in -- and both are 2168 bytes on the wire, so nothing complains when the kernel sends
++ * the wrong one.  Every client that asked the kernel for space read a shifted structure: f_btotal
++ * came out as the block size, and f_fstypename landed in the middle of the mount point names.  On
++ * this phone that is what made SQLite take the "lock proxy" path of a network file system (the
++ * assetsd crash on the photo library), and what Settings' disk figures used to be about before it
++ * was switched to getattrlist.
++ */
++struct hakios_statfs_user {
++	uint32_t f_bsize;
++	int32_t f_iosize;
++	uint64_t f_blocks;
++	uint64_t f_bfree;
++	uint64_t f_bavail;
++	uint64_t f_files;
++	uint64_t f_ffree;
++	fsid_t f_fsid;
++	uid_t f_owner;
++	uint32_t f_type;
++	uint32_t f_flags;
++	uint32_t f_fssubtype;
++	char f_fstypename[MFSTYPENAMELEN];
++	char f_mntonname[MAXPATHLEN];
++	char f_mntfromname[MAXPATHLEN];
++	uint32_t f_flags_ext;
++	uint32_t f_reserved[7];
++};
++
++static int
++hakios_statfs_user_out(struct mount *mp, struct vfsstatfs *sfsp, user_addr_t bufp, int *sizep)
++{
++	struct hakios_statfs_user out;
++
++	bzero(&out, sizeof(out));
++	out.f_bsize = sfsp->f_bsize;
++	out.f_iosize = (int32_t)sfsp->f_iosize;
++	out.f_blocks = sfsp->f_blocks;
++	out.f_bfree = sfsp->f_bfree;
++	out.f_bavail = sfsp->f_bavail;
++	out.f_files = sfsp->f_files;
++	out.f_ffree = sfsp->f_ffree;
++	out.f_fsid = sfsp->f_fsid;
++	out.f_owner = sfsp->f_owner;
++	out.f_type = (uint32_t)mp->mnt_vtable->vfc_typenum;
++	out.f_flags = (uint32_t)(mp->mnt_flag & MNT_VISFLAGMASK);
++	out.f_fssubtype = (uint32_t)sfsp->f_fssubtype;
++	if (mp->mnt_kern_flag & MNTK_TYPENAME_OVERRIDE) {
++		strlcpy(out.f_fstypename, &mp->fstypename_override[0], sizeof(out.f_fstypename));
++	} else {
++		strlcpy(out.f_fstypename, &sfsp->f_fstypename[0], sizeof(out.f_fstypename));
++	}
++	strlcpy(out.f_mntonname, &sfsp->f_mntonname[0], sizeof(out.f_mntonname));
++	strlcpy(out.f_mntfromname, &sfsp->f_mntfromname[0], sizeof(out.f_mntfromname));
++	out.f_flags_ext = (mp->mnt_kern_flag & MNTK_SYSTEMDATA) ? MNT_EXT_ROOT_DATA_VOL : 0;
++	if (sizep != NULL) {
++		*sizep = (int)sizeof(out);
++	}
++	return copyout((caddr_t)&out, bufp, sizeof(out));
++}
++
+ static int
+ statfs_internal(proc_t p, struct mount *mp, user_addr_t bufp)
+ {
+@@ -3423,7 +3488,7 @@ statfs_internal(proc_t p, struct mount *mp, user_addr_t bufp)
+ 		return error;
+ 	}
+ 
+-	return munge_statfs(mp, &mp->mnt_vfsstat, bufp, NULL, IS_64BIT_PROCESS(p), TRUE);
++	return hakios_statfs_user_out(mp, &mp->mnt_vfsstat, bufp, NULL);
+ }
+ 
+ /*
+@@ -3688,7 +3753,7 @@ getfsstat_callback(mount_t mp, void * arg)
+ 		/*
+ 		 * Need to handle LP64 version of struct statfs
+ 		 */
+-		error = munge_statfs(mp, sp, fstp->sfsp, &my_size, IS_64BIT_PROCESS(vfs_context_proc(ctx)), FALSE);
++		error = hakios_statfs_user_out(mp, sp, fstp->sfsp, &my_size);
+ 		if (error) {
+ 			fstp->error = error;
+ 			return VFS_RETURNED_DONE;
+@@ -7261,7 +7326,7 @@ readlinkat_internal(vfs_context_t ctx, int fd, vnode_t lnk_vp, user_addr_t path,
  	uio_t auio;
  	int error;
  	struct nameidata nd;
@@ -1340,7 +1738,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  	bool put_vnode;
  
  	if (bufsize > INT32_MAX) {
-@@ -10314,7 +10314,7 @@ getdirentries_common(int fd, user_addr_t bufp, user_size_t bufsize, ssize_t *byt
+@@ -10314,7 +10379,7 @@ getdirentries_common(int fd, user_addr_t bufp, user_size_t bufsize, ssize_t *byt
  	int spacetype = proc_is64bit(vfs_context_proc(&context)) ? UIO_USERSPACE64 : UIO_USERSPACE32;
  	off_t loff;
  	int error, numdirent;
@@ -1349,7 +1747,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  
  get_from_fd:
  	error = fp_getfvp(vfs_context_proc(&context), fd, &fp, &vp);
-@@ -10613,7 +10613,7 @@ getdirentriesattr(proc_t p, struct getdirentriesattr_args *uap, int32_t *retval)
+@@ -10613,7 +10678,7 @@ getdirentriesattr(proc_t p, struct getdirentriesattr_args *uap, int32_t *retval)
  	struct attrlist attributelist;
  	vfs_context_t ctx = vfs_context_current();
  	int fd = uap->fd;
@@ -1358,7 +1756,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  	kauth_action_t action;
  
  	AUDIT_ARG(fd, fd);
-@@ -10954,7 +10954,7 @@ searchfs(proc_t p, struct searchfs_args *uap, __unused int32_t *retval)
+@@ -10954,7 +11019,7 @@ searchfs(proc_t p, struct searchfs_args *uap, __unused int32_t *retval)
  	size_t mallocsize;
  	uint32_t nameiflags;
  	vfs_context_t ctx = vfs_context_current();
@@ -1367,7 +1765,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  
  	/* Start by copying in fsearchblock parameter list */
  	if (IS_64BIT_PROCESS(p)) {
-@@ -12906,7 +12906,7 @@ getxattr(proc_t p, struct getxattr_args *uap, user_ssize_t *retval)
+@@ -12906,7 +12971,7 @@ getxattr(proc_t p, struct getxattr_args *uap, user_ssize_t *retval)
  	size_t namelen;
  	u_int32_t nameiflags;
  	int error;
@@ -1376,7 +1774,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  
  	if (uap->options & (XATTR_NOSECURITY | XATTR_NODEFAULT)) {
  		return EINVAL;
-@@ -12990,7 +12990,7 @@ fgetxattr(proc_t p, struct fgetxattr_args *uap, user_ssize_t *retval)
+@@ -12990,7 +13055,7 @@ fgetxattr(proc_t p, struct fgetxattr_args *uap, user_ssize_t *retval)
  	size_t attrsize = 0;
  	size_t namelen;
  	int error;
@@ -1385,7 +1783,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  
  	if (uap->options & (XATTR_NOFOLLOW | XATTR_NOSECURITY | XATTR_NODEFAULT)) {
  		return EINVAL;
-@@ -13038,7 +13038,7 @@ out:
+@@ -13038,7 +13103,7 @@ out:
  struct setxattr_ctx {
  	struct nameidata nd;
  	char attrname[XATTR_MAXNAMELEN + 1];
@@ -1394,7 +1792,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  };
  
  /*
-@@ -13134,7 +13134,7 @@ fsetxattr(proc_t p, struct fsetxattr_args *uap, int *retval)
+@@ -13134,7 +13199,7 @@ fsetxattr(proc_t p, struct fsetxattr_args *uap, int *retval)
  	int spacetype = IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32;
  	size_t namelen;
  	int error;
@@ -1403,7 +1801,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  
  	if (uap->options & (XATTR_NOFOLLOW | XATTR_NOSECURITY | XATTR_NODEFAULT)) {
  		return EINVAL;
-@@ -13311,7 +13311,7 @@ listxattr(proc_t p, struct listxattr_args *uap, user_ssize_t *retval)
+@@ -13311,7 +13376,7 @@ listxattr(proc_t p, struct listxattr_args *uap, user_ssize_t *retval)
  	size_t attrsize = 0;
  	u_int32_t nameiflags;
  	int error;
@@ -1412,7 +1810,7 @@ index 2bbba037c2dd..ee65d5943196 100644
  
  	if (uap->options & (XATTR_NOSECURITY | XATTR_NODEFAULT)) {
  		return EINVAL;
-@@ -13353,7 +13353,7 @@ flistxattr(proc_t p, struct flistxattr_args *uap, user_ssize_t *retval)
+@@ -13353,7 +13418,7 @@ flistxattr(proc_t p, struct flistxattr_args *uap, user_ssize_t *retval)
  	int spacetype = proc_is64bit(p) ? UIO_USERSPACE64 : UIO_USERSPACE32;
  	size_t attrsize = 0;
  	int error;
@@ -1422,10 +1820,28 @@ index 2bbba037c2dd..ee65d5943196 100644
  	if (uap->options & (XATTR_NOFOLLOW | XATTR_NOSECURITY | XATTR_NODEFAULT)) {
  		return EINVAL;
 diff --git a/bsd/vfs/vfs_vnops.c b/bsd/vfs/vfs_vnops.c
-index 5b51e9c46a8d..6872b94631c9 100644
+index 5b51e9c46a8d..037829540925 100644
 --- a/bsd/vfs/vfs_vnops.c
 +++ b/bsd/vfs/vfs_vnops.c
-@@ -964,7 +964,7 @@ vn_rdwr_64(
+@@ -73,6 +73,7 @@
+  * Version 2.0.
+  */
+ 
++extern char apfs_mount_why[1024];        /* debug: apfs vfsops.c */
+ #include <sys/param.h>
+ #include <sys/types.h>
+ #include <sys/systm.h>
+@@ -238,7 +239,8 @@ vn_open_auth_do_create(struct nameidata *ndp, struct vnode_attr *vap, int fmode,
+ 	} else {
+ #endif
+ 	if (!batched) {
+-		if ((error = vn_authorize_create(dvp, &ndp->ni_cnd, vap, ctx, NULL)) != 0) {
++		error = vn_authorize_create(dvp, &ndp->ni_cnd, vap, ctx, NULL);
++		if (error != 0) {
+ 			goto out;
+ 		}
+ 	}
+@@ -964,7 +966,7 @@ vn_rdwr_64(
  	int spacetype;
  	struct vfs_context context;
  	int error = 0;
@@ -3123,7 +3539,7 @@ index 3ad743fc3efb..ce036c5a2c26 100644
  void
  pe_init_fiq()
 diff --git a/pexpert/arm/pe_kprintf.c b/pexpert/arm/pe_kprintf.c
-index 65144c74239c..ab6260d52d84 100644
+index 65144c74239c..7a23ae43a647 100644
 --- a/pexpert/arm/pe_kprintf.c
 +++ b/pexpert/arm/pe_kprintf.c
 @@ -29,6 +29,7 @@ SECURITY_READ_ONLY_LATE(bool) enable_dklog_serial_output = false;
@@ -3134,7 +3550,46 @@ index 65144c74239c..ab6260d52d84 100644
  
  __startup_func
  static void
-@@ -159,6 +160,7 @@ serial_putc_crlf(char c)
+@@ -38,18 +39,8 @@ PE_init_kprintf_config(void)
+ 		panic("Platform Expert not initialized");
+ 	}
+ 
+-	if (debug_boot_arg & DB_KPRT) {
+-		disable_serial_output = false;
+-	}
+-
+-#if DEBUG
++	disable_serial_output = false;
+ 	disable_kprintf_output = false;
+-#elif DEVELOPMENT
+-	bool enable_kprintf_spam = false;
+-	if (PE_parse_boot_argn("-enable_kprintf_spam", &enable_kprintf_spam, sizeof(enable_kprintf_spam))) {
+-		disable_kprintf_output = false;
+-	}
+-#endif
+ }
+ // Do this early, so other code can depend on whether kprintf is enabled.
+ STARTUP(TUNABLES, STARTUP_RANK_LAST, PE_init_kprintf_config);
+@@ -58,16 +49,8 @@ __startup_func
+ static void
+ PE_init_kprintf(void)
+ {
+-	if (serial_init()) {
+-		PE_kputc = serial_putc_crlf;
+-	} else {
+-		/**
+-		 * If serial failed to initialize then fall back to using the console,
+-		 * and assume the console is using the video console (because clearly
+-		 * serial doesn't work).
+-		 */
+-		PE_kputc = console_write_unbuffered;
+-	}
++	(void)serial_init();
++	PE_kputc = serial_putc_crlf;
+ }
+ STARTUP(KPRINTF, STARTUP_RANK_FIRST, PE_init_kprintf);
+ 
+@@ -159,6 +142,7 @@ serial_putc_crlf(char c)
  	if (c == '\n') {
  		uart_putc('\r');
  	}

@@ -161,6 +161,8 @@ static volatile bool hc_in, hc_closed, hc_dead;
 static uint32_t hc_is_in, hc_cnr_in;            /* IS and UTRLCNR when this kernel's list went in */
 static uint64_t hc_requests, hc_errors, hc_bytes, hc_wait_us, hc_refused, hc_most_in_flight, hc_proofs;
 static uint64_t hc_switch_in_count, hc_switch_out_count;
+/* ufs_trace=1: the two lines of a controller-list switch that went right (see hc_put_back_print) */
+static bool hc_trace;
 static uint32_t hc_in_flight;
 /* where the time goes: doorbell reads while waiting, waits for a free slot, taking hc_lock, how many in flight */
 static uint64_t hc_polls, hc_slot_waits, hc_slot_wait_ticks, hc_lock_ticks, hc_flight_hist[6];
@@ -935,6 +937,15 @@ hc_put_back_print(const char *why, const struct hc_put_back_result *r, bool late
 		say("ufs: native: %s: doorbell %08x did not clear in 1 s: this kernel's slots cleared (UTRLCLR), doorbell "
 		    "then %08x\n", why, r->db_before, r->db_after_clear);
 	}
+	/*
+	 * Both directions of the switch happen for every block a commit writes, so the two lines
+	 * that say it is back (and that it went in) are a boot-arg away: they fill the kernel log
+	 * and the screen, and in a working run they say nothing new.  Every way it can go wrong is
+	 * still said always.
+	 */
+	if (r->ok && !hc_trace) {
+		return;
+	}
 	say("ufs: native: %s: transfer list %s UEFI's %08x:%08x (run %u, doorbell %08x; IS %08x, at the switch %08x; "
 	    "completion %08x after clearing this kernel's %08x, at the switch %08x%s)\n", why, r->ok ? "back to" :
 	    "NOT BACK TO", r->hi, r->lo, r->rsr, r->db, r->is, hc_is_in, r->cnr, r->cnr_ours, hc_cnr_in,
@@ -1025,9 +1036,11 @@ ufshc_switch_in(bool prove)
 		    "slot 0 %08x, CDB %02x)\n", no, hi, lo, db, rsr, hcs, uefi_dw0, uefi_upiu[16]);
 		return EIO;
 	}
-	hc_say("ufs: native: transfer list switched from UEFI's %08x:%08x to this kernel's %08x:%08x (doorbell 0, run %u; "
-	    "IS %08x, completion %08x; UEFI's slot 0 holds a read: %08x, CDB %02x)\n", hc_loader.uefi_hi,
-	    hc_loader.uefi_lo, hi, lo, rsr, hc_is_in, hc_cnr_in, uefi_dw0, uefi_upiu[16]);
+	if (hc_trace) {
+		hc_say("ufs: native: transfer list switched from UEFI's %08x:%08x to this kernel's %08x:%08x (doorbell 0, run %u; "
+		    "IS %08x, completion %08x; UEFI's slot 0 holds a read: %08x, CDB %02x)\n", hc_loader.uefi_hi,
+		    hc_loader.uefi_lo, hi, lo, rsr, hc_is_in, hc_cnr_in, uefi_dw0, uefi_upiu[16]);
+	}
 	if (prove) {
 		int e = hc_prove();
 
@@ -1151,6 +1164,13 @@ ufshc_probe(const struct ufshc_loader *loader, bool only)
 	}
 	PE_parse_boot_argn("ufs_native_leave", &hc_leave, sizeof(hc_leave));
 	PE_parse_boot_argn("ufs_native_hang", &hc_hang_after, sizeof(hc_hang_after));
+	{
+		int tracing = 0;
+
+		if (PE_parse_boot_argn("ufs_trace", &tracing, sizeof(tracing))) {
+			hc_trace = tracing != 0;
+		}
+	}
 	if (loader->hc_pa != UFSHC_PHYS || loader->area_pa == 0 || loader->slots != SLOTS || (loader->area_pa & 0x3ff) ||
 	    loader->ucd_size < UCD_PRDT + 16 * (hc_slot_buffer / PRD_MAX + 1) || (loader->ucd_offset & 0x7f) ||
 	    (loader->ucd_size & 0x7f) || loader->ucd_offset < SLOTS * 32 ||

@@ -62,6 +62,19 @@ struct apfs_mount {
 	mount_t            am_mp;
 	vnode_t            am_devvp;
 	lck_mtx_t          am_lock;
+	/*
+	 * One writer at a time.  am_lock is let go of around a device read
+	 * (nx_block_unlocked), so two operations that both commit could otherwise
+	 * interleave: each would start from the same checkpoint, with its own copy of
+	 * the space manager, and both would hand out the same blocks.  Held for the
+	 * whole operation, and only by operations that write; recursive by owner, as a
+	 * write can reach pageout and a create takes it again to undo itself.
+	 */
+	lck_mtx_t          am_wlock;
+	thread_t           am_wlock_owner;
+	uint32_t           am_wlock_depth;
+	uint64_t           am_wlock_since;  /* apfs_ticks() when it was taken; 0 when free */
+	char               am_wlock_name[MAXCOMLEN + 1]; /* the process that holds it */
 	struct apfs_nx     am_nx;
 	struct apfs_vol    am_vol;
 	uint32_t           am_devblock;
@@ -95,19 +108,23 @@ struct apfs_mount {
 	 * The operations going on (taken apfs_lock, not yet apfs_unlock; apfs_lib may let go of
 	 * the lock in between), and the container's epoch each began at: retired cache memory
 	 * older than the oldest of them is freed (apfs_nx_reclaim). Under am_lock.
+	 * Allocated with the mount, apart from it: the mount has to stay within kalloc_type's
+	 * 16 KB, and the time each one began and who began it need the room.
 	 */
 #define APFS_OPS_MAX 128
-	struct {
+	struct apfs_op {
 		thread_t           th;
 		uint64_t           epoch;
 		const char        *site;        /* the function that began it */
-	}                  am_ops[APFS_OPS_MAX];
+		uint64_t           start;       /* apfs_ticks() when it began */
+		char               name[MAXCOMLEN + 1]; /* the process it is doing this for */
+	}                 *am_ops;
 	/*
 	 * The lock by who takes it (the function that called apfs_lock; apfs_lib's taking it back in
 	 * the middle of an operation counts for the operation's): takes, waiting (in all, the longest,
 	 * how many over 1 ms), holding (the same). Under am_lock.
 	 */
-#define APFS_LOCK_SITES 32
+#define APFS_LOCK_SITES 16
 	struct apfs_lock_site {
 		const char        *name;
 		uint64_t           takes, relocks;
@@ -149,6 +166,8 @@ struct apfs_mount {
 	bool               am_ubc_read;     /* read(2) through the page cache (boot-arg apfs_ubc_read, default 1) */
 	uint32_t           am_nops;
 	uint32_t           am_untracked;    /* operations the table had no room for: nothing is freed meanwhile */
+	void              *am_wd_call;      /* thread_call_t: the watchdog that names what does not return */
+	bool               am_wd_stop;      /* the mount is going away */
 	/* how long it was held: up to 10 us, 100 us, 1 ms, 10 ms, more; and the longest */
 	uint64_t           am_lock_hold_hist[5];
 	uint64_t           am_lock_hold_max;
@@ -182,6 +201,7 @@ struct apfs_node {
 	uint16_t           an_mode;
 	uint64_t           an_size;     /* the logical size, as a reader of the file sees it */
 	bool               an_attached; /* an_vp is set and the node is in the hash */
+	bool               an_unlinked; /* the last name went; the inode waits for the last close */
 	/*
 	 * What has been worked out about how this file's contents are stored, kept for as
 	 * long as the vnode lives: the table of compressed pieces and the piece last
@@ -232,8 +252,11 @@ void apfs_stats_print(void);
 void apfs_lock_at(struct apfs_mount *am, const char *site);  /* an operation begins */
 #define apfs_lock(am) apfs_lock_at((am), __func__)
 void apfs_unlock(struct apfs_mount *am);         /* and ends */
-void apfs_lock_inner(struct apfs_mount *am);     /* the lock taken back in the middle of one (apfs_lib) */
 void apfs_unlock_inner(struct apfs_mount *am);   /* let go of in the middle of one */
+
+/* the watchdog that names the operations and the writer's mutex that do not come back */
+void apfs_watchdog_begin(struct apfs_mount *am);
+void apfs_watchdog_end(struct apfs_mount *am);
 
 /* apfs_vnops.c */
 extern const struct vnodeopv_desc apfs_vnodeop_opv_desc;

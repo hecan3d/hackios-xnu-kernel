@@ -123,6 +123,8 @@ apfs_mode_to_dtype(uint16_t mode)
  * hand passes over a block used that recently -- which is why a B-tree descent holds
  * block addresses and not pointers.
  */
+const char *apfs_where = "?";    /* debug: who is reading, see the bad-checksum log */
+
 static inline uint32_t
 cache_bucket(uint64_t addr)
 {
@@ -189,6 +191,34 @@ apfs_nx_cache_flush(struct apfs_nx *nx)
 	}
 }
 #endif
+
+/*
+ * A block that was just written is not what the cache has for that address any more.  A
+ * reader that still holds the old copy keeps it (cache_retire), and the next read comes
+ * from the device.
+ */
+void
+apfs_nx_cache_drop(struct apfs_nx *nx, uint64_t addr)
+{
+	uint32_t bucket = cache_bucket(addr);
+	int32_t *pp = &nx->cache_hash[bucket], i;
+
+	while ((i = *pp) >= 0) {
+		struct apfs_buf *b = &nx->cache[i];
+
+		if (b->addr == addr) {
+			*pp = b->next;
+			cache_retire(nx, b->data);
+			b->data = NULL;
+			b->addr = APFS_BUF_EMPTY;
+			b->next = -1;
+			b->checked = false;
+			b->ref = false;
+			return;
+		}
+		pp = &b->next;
+	}
+}
 
 /* A free slot, or the first the clock hand finds neither used since it last passed nor recent. */
 static struct apfs_buf *
@@ -381,7 +411,8 @@ nx_block(struct apfs_nx *nx, uint64_t addr, const uint8_t **out, bool verify)
 		if (verify && !b->checked) {
 			/* brought in as a neighbour, asked for now */
 			if (!apfs_checksum_ok(b->data, nx->block_size)) {
-				apfs_log("block %llu: bad checksum\n", (unsigned long long)addr);
+				apfs_log("block %llu: bad checksum (%s)\n",
+				    (unsigned long long)addr, apfs_where);
 				return EIO;
 			}
 			b->checked = true;
@@ -437,7 +468,8 @@ nx_block(struct apfs_nx *nx, uint64_t addr, const uint8_t **out, bool verify)
 	}
 	nx->reads++;
 	if (verify && !apfs_checksum_ok(victim->data, nx->block_size)) {
-		apfs_log("block %llu: bad checksum\n", (unsigned long long)addr);
+		apfs_log("block %llu: bad checksum (%s)\n", (unsigned long long)addr,
+		    apfs_where);
 		return EIO;
 	}
 	victim->checked = verify;
@@ -534,11 +566,13 @@ node_parse(struct apfs_btree *tree, const uint8_t *blk, struct node *n)
 	n->leaf = (n->flags & APFS_BTNODE_LEAF) != 0;
 
 	if (n->level >= APFS_MAX_LEVELS) {
+		apfs_log("node_parse: level %u >= MAX_LEVELS\n", n->level);
 		return EIO;
 	}
 	n->toc_off = 56 + ts_off;
 	n->toc_len = ts_len;
 	if (n->toc_off < 56 || n->toc_off > bs || n->toc_len > bs - n->toc_off) {
+		apfs_log("node_parse: bad toc_off %u toc_len %u bs %u\n", n->toc_off, n->toc_len, bs);
 		return EIO;
 	}
 	n->key_base = n->toc_off + n->toc_len;
@@ -591,8 +625,13 @@ node_entry(struct apfs_btree *tree, const struct node *n, uint32_t i,
 		voff = le16(n->blk + n->toc_off + 8 * i + 4);
 		vl = le16(n->blk + n->toc_off + 8 * i + 6);
 	}
+	if (kl < 8 && !(i == 0 && !n->leaf && kl == 0)) {
+		apfs_log("node_entry: entry %u of %u (fixed %d, leaf %d, level %u, flags 0x%x, key_size %u): koff %u kl %u voff %u vl %u toc_off %u\n",
+		    i, n->nkeys, n->fixed, n->leaf, n->level, n->flags, tree->key_size, koff, kl, voff, vl, n->toc_off);
+	}
 	/* a key lives at key_base + offset and must end before the value area */
 	if (koff > n->val_end - n->key_base || kl > n->val_end - n->key_base - koff) {
+		apfs_log("node_entry %u: key bounds error: koff %u kl %u key_base %u val_end %u\n", i, koff, kl, n->key_base, n->val_end);
 		return EIO;
 	}
 	*kp = n->blk + n->key_base + koff;
@@ -717,6 +756,8 @@ node_at_h(struct apfs_btree *tree, uint64_t addr, uint64_t hash8, const uint8_t 
 		}
 	} else if (obj_type(*blk) != APFS_OBJECT_TYPE_BTREE &&
 	    obj_type(*blk) != APFS_OBJECT_TYPE_BTREE_NODE) {
+		apfs_log("node_at_h %llu: bad obj_type 0x%x\n",
+		    (unsigned long long)addr, obj_type(*blk));
 		return EIO;
 	}
 	return node_parse(tree, *blk, n);
@@ -784,7 +825,7 @@ node_child_addr(struct apfs_btree *tree, const struct node *n, uint32_t i, uint6
 /* ------------------------------------------------------------------ object maps */
 
 static int omap_find(struct apfs_omap *omap, uint64_t oid, apfs_xid_t want_xid,
-    uint64_t *addr);
+    uint64_t *addr, apfs_xid_t *key_xid);
 
 static int
 tree_node_addr(struct apfs_btree *tree, uint64_t oid, uint64_t *addr)
@@ -793,7 +834,7 @@ tree_node_addr(struct apfs_btree *tree, uint64_t oid, uint64_t *addr)
 		*addr = oid;
 		return 0;
 	}
-	return omap_find(tree->omap, oid, tree->nx->xid, addr);
+	return omap_find(tree->omap, oid, tree->nx->xid, addr, NULL);
 }
 
 /* Read a tree's root and remember what its btree_info says about the whole tree. */
@@ -814,7 +855,7 @@ btree_open(struct apfs_nx *nx, struct apfs_omap *omap, uint64_t root_oid,
 	if (omap == NULL) {
 		addr = root_oid;
 	} else {
-		error = omap_find(omap, root_oid, nx->xid, &addr);
+		error = omap_find(omap, root_oid, nx->xid, &addr, NULL);
 		if (error) {
 			return error;
 		}
@@ -880,7 +921,8 @@ omap_open(struct apfs_nx *nx, uint64_t omap_addr, struct apfs_omap *omap)
  * the versions of one object are a run; we want the newest that is not past want_xid.
  */
 static int
-omap_find(struct apfs_omap *omap, uint64_t oid, apfs_xid_t want_xid, uint64_t *addr)
+omap_find(struct apfs_omap *omap, uint64_t oid, apfs_xid_t want_xid, uint64_t *addr,
+    apfs_xid_t *key_xid)
 {
 	struct apfs_btree *tree = &omap->tree;
 	uint64_t node_oid = tree->root;
@@ -901,10 +943,14 @@ omap_find(struct apfs_omap *omap, uint64_t oid, apfs_xid_t want_xid, uint64_t *a
 		    hit->map == tree->root) {
 			tree->nx->omap_hits++;
 			*addr = hit->addr;
+			if (key_xid != NULL) {
+				*key_xid = hit->key_xid;
+			}
 			return 0;
 		}
 		tree->nx->omap_misses++;
 	}
+	apfs_where = "omap_find";
 	error = nx_block(tree->nx, node_oid, &blk, true);
 	if (error) {
 		return error;
@@ -961,8 +1007,14 @@ omap_find(struct apfs_omap *omap, uint64_t oid, apfs_xid_t want_xid, uint64_t *a
 				return EIO;
 			}
 			/* omap_val: flags, size, then the block address */
+			if (key_xid != NULL) {
+				*key_xid = le64(k + 8);
+			}
 			*addr = le64(v + 8);
 			if (*addr == 0 || *addr >= tree->nx->block_count) {
+				apfs_log("omap_find oid %llu: bad addr %llu (block_count %llu)\n",
+				    (unsigned long long)oid, (unsigned long long)*addr,
+				    (unsigned long long)tree->nx->block_count);
 				return EIO;
 			}
 			if (hit != NULL) {
@@ -970,6 +1022,7 @@ omap_find(struct apfs_omap *omap, uint64_t oid, apfs_xid_t want_xid, uint64_t *a
 				hit->oid = oid;
 				hit->xid = want_xid;
 				hit->addr = *addr;
+				hit->key_xid = le64(k + 8);
 			}
 			return 0;
 		}
@@ -1043,10 +1096,13 @@ apfs_nx_open(struct apfs_nx *nx, const struct apfs_dev *dev)
 	}
 	error = nx->dev.read(nx->dev.ctx, 0, block0, APFS_NX_MINIMUM_BLOCK_SIZE);
 	if (error) {
+		apfs_log("nx_open read block0 failed: %d\n", error);
 		goto out;
 	}
 	error = EINVAL;
 	if (le32(block0 + 32) != APFS_NX_MAGIC) {
+		apfs_log("nx_open block0 magic mismatch: 0x%08x (%.4s)\n",
+		    le32(block0 + 32), (char *)block0 + 32);
 		goto out;           /* not an APFS container; let the caller try something else */
 	}
 	bs = le32(block0 + 36);
@@ -1110,6 +1166,10 @@ apfs_nx_open(struct apfs_nx *nx, const struct apfs_dev *dev)
 	nx->xp_data_blocks = le32(blk + 108);
 	nx->xp_desc_base = le64(blk + 112);
 	nx->xp_data_base = le64(blk + 120);
+	nx->xp_desc_next = le32(blk + 128);
+	nx->xp_data_next = le32(blk + 132);
+	nx->xp_desc_index = le32(blk + 136);
+	nx->xp_desc_len = le32(blk + 140);
 	nx->omap_addr = le64(blk + 160);
 	{
 		uint32_t maxfs = le32(blk + 180);
@@ -1126,6 +1186,15 @@ apfs_nx_open(struct apfs_nx *nx, const struct apfs_dev *dev)
 				nx->fs_count = i + 1;
 			}
 		}
+	}
+	if (dev->write != NULL) {
+		/* a writer copies the live superblock rather than searching the ring again */
+		nx->sb = apfs_alloc(nx->block_size);
+		if (nx->sb == NULL) {
+			error = ENOMEM;
+			goto out;
+		}
+		memcpy(nx->sb, blk, nx->block_size);
 	}
 	error = omap_open(nx, nx->omap_addr, &nx->omap);
 	if (error) {
@@ -1148,6 +1217,10 @@ apfs_nx_close(struct apfs_nx *nx)
 	uint32_t i;
 
 	scratch_drain(nx);
+	if (nx->sb != NULL) {
+		apfs_free(nx->sb, nx->block_size);
+		nx->sb = NULL;
+	}
 	if (nx->omap_cache != NULL) {
 		apfs_free(nx->omap_cache, APFS_OMAP_CACHE * sizeof(*nx->omap_cache));
 		nx->omap_cache = NULL;
@@ -1173,6 +1246,379 @@ apfs_nx_close(struct apfs_nx *nx)
 	apfs_nx_reclaim(nx, ~0ULL);
 }
 
+/* A block of metadata for a caller that only has the public header. */
+int
+apfs_omap_lookup(struct apfs_omap *omap, apfs_oid_t oid, apfs_xid_t xid,
+    uint64_t *addr)
+{
+	return omap_find(omap, oid, xid, addr, NULL);
+}
+
+int
+apfs_omap_lookup_key(struct apfs_omap *omap, apfs_oid_t oid, apfs_xid_t xid,
+    uint64_t *addr, apfs_xid_t *key_xid)
+{
+	return omap_find(omap, oid, xid, addr, key_xid);
+}
+
+int
+apfs_block_read(struct apfs_nx *nx, uint64_t addr, const uint8_t **block)
+{
+	return nx_block(nx, addr, block, true);
+}
+
+int
+apfs_block_read_raw(struct apfs_nx *nx, uint64_t addr, const uint8_t **block)
+{
+	return nx_block(nx, addr, block, false);
+}
+
+/* ------------------------------------------------------------- the space manager */
+
+/*
+ * The space manager is an ephemeral object: it has no fixed place, and the checkpoint map
+ * of the live transaction says where in the checkpoint data ring it lies.  The map is in
+ * the checkpoint's own descriptor blocks (nx_xp_desc_index, nx_xp_desc_len of the ring),
+ * may be more than one block, and the last of them says so with cpm_flags.
+ */
+static int
+spaceman_find(struct apfs_nx *nx, struct apfs_spaceman *sm, uint64_t *addr, uint32_t *size)
+{
+	const uint8_t *blk;
+	uint32_t i, maps, m, len;
+	uint64_t index;
+	int error = ENOENT;
+
+	*addr = 0;
+	*size = 0;
+	if (nx->xp_desc_blocks == 0 || nx->xp_desc_len == 0) {
+		return ENOENT;
+	}
+	index = nx->xp_desc_index;
+	len = nx->xp_desc_len;
+	if (len > nx->xp_desc_blocks) {
+		len = nx->xp_desc_blocks;
+	}
+	for (i = 0; i < len; i++) {
+		uint64_t at = nx->xp_desc_base + (index + i) % nx->xp_desc_blocks;
+
+		if (nx_block(nx, at, &blk, true) != 0) {
+			continue;
+		}
+		if (obj_type(blk) != APFS_OBJECT_TYPE_CHECKPOINT_MAP || obj_xid(blk) != nx->xid) {
+			continue;
+		}
+		maps = le32(blk + 36);
+		if (maps > (nx->block_size - 40) / 40) {
+			maps = (nx->block_size - 40) / 40;
+		}
+		error = 0;              /* a map of this checkpoint: take its every entry */
+		for (m = 0; m < maps; m++) {
+			const uint8_t *e = blk + 40 + (size_t)m * 40;
+
+			if (sm->map_count < APFS_SM_MAX_MAPS) {
+				struct apfs_sm_map *mp = &sm->map[sm->map_count];
+
+				mp->type = le32(e);
+				mp->subtype = le32(e + 4);
+				mp->size = le32(e + 8);
+				mp->oid = le64(e + 24);
+				mp->paddr = le64(e + 32);
+				sm->map_count++;
+			}
+			if ((le32(e) & APFS_OBJECT_TYPE_MASK) != APFS_OBJECT_TYPE_SPACEMAN) {
+				continue;
+			}
+			*addr = le64(e + 32);
+			*size = le32(e + 8);
+		}
+		if ((le32(blk + 32) & APFS_CHECKPOINT_MAP_LAST) != 0) {
+			break;
+		}
+	}
+	return error;
+}
+
+#define SM_OFF(f)      ((uint32_t)offsetof(struct apfs_spaceman_phys, f))
+#define SMD_OFF(f)     (SM_OFF(sm_dev) + (uint32_t)offsetof(struct apfs_spaceman_device, f))
+
+int
+apfs_spaceman_open(struct apfs_nx *nx, struct apfs_spaceman *sm)
+{
+	const uint8_t *blk;
+	uint8_t *obj;
+	uint64_t addr;
+	uint32_t size, blocks, i, entries, cabs, min;
+	int error;
+
+	memset(sm, 0, sizeof(*sm));
+	sm->nx = nx;
+	error = spaceman_find(nx, sm, &addr, &size);
+	if (error) {
+		apfs_log("the checkpoint map names no space manager\n");
+		return error;
+	}
+	/*
+	 * A space manager is one or a few blocks, the checksum over the lot.  The bound is
+	 * generous for a real container and still keeps a damaged map from asking for memory
+	 * by the megabyte: at 4096 bytes a block, 1024 blocks is a manager for 32 TB.
+	 */
+	if (size < 344 || (size % nx->block_size) != 0 || size > 1024 * nx->block_size ||
+	    addr == 0 || addr + size / nx->block_size > nx->block_count) {
+		apfs_log("the checkpoint map names no space manager this can read "
+		    "(%u bytes at block %llu)\n", size, (unsigned long long)addr);
+		return EIO;
+	}
+	blocks = size / nx->block_size;
+	obj = apfs_alloc(size);
+	if (obj == NULL) {
+		return ENOMEM;
+	}
+	error = EIO;
+	for (i = 0; i < blocks; i++) {
+		/* only the first block carries the header, and the checksum covers them all */
+		if (nx_block(nx, addr + i, &blk, i == 0) != 0) {
+			goto out;
+		}
+		memcpy(obj + (size_t)i * nx->block_size, blk, nx->block_size);
+	}
+	if (!apfs_checksum_ok(obj, size) || obj_type(obj) != APFS_OBJECT_TYPE_SPACEMAN) {
+		apfs_log("the space manager does not check out\n");
+		goto out;
+	}
+	sm->sm = obj;
+	sm->sm_size = size;
+	sm->xid = obj_xid(obj);
+	sm->block_size = le32(obj + SM_OFF(sm_block_size));
+	sm->blocks_per_chunk = le32(obj + SM_OFF(sm_blocks_per_chunk));
+	sm->chunks_per_cib = le32(obj + SM_OFF(sm_chunks_per_cib));
+	sm->cibs_per_cab = le32(obj + SM_OFF(sm_cibs_per_cab));
+	sm->block_count = le64(obj + SMD_OFF(sm_block_count));
+	sm->chunk_count = (uint32_t)le64(obj + SMD_OFF(sm_chunk_count));
+	sm->cib_count = le32(obj + SMD_OFF(sm_cib_count));
+	sm->cab_count = le32(obj + SMD_OFF(sm_cab_count));
+	sm->free_count = le64(obj + SMD_OFF(sm_free_count));
+	sm->addr_offset = le32(obj + SMD_OFF(sm_addr_offset));
+	sm->ip_block_count = le64(obj + SM_OFF(sm_ip_block_count));
+	sm->ip_bm_size_in_blocks = le32(obj + SM_OFF(sm_ip_bm_size_in_blocks));
+	sm->ip_bm_block_count = le32(obj + SM_OFF(sm_ip_bm_block_count));
+	sm->ip_bm_base = le64(obj + SM_OFF(sm_ip_bm_base));
+	sm->ip_base = le64(obj + SM_OFF(sm_ip_base));
+	sm->ip_bm_free_head = le16(obj + SM_OFF(sm_ip_bm_free_head));
+	sm->ip_bm_free_tail = le16(obj + SM_OFF(sm_ip_bm_free_tail));
+	sm->ip_bm_xid_offset = le32(obj + SM_OFF(sm_ip_bm_xid_offset));
+	sm->ip_bitmap_offset = le32(obj + SM_OFF(sm_ip_bitmap_offset));
+	sm->ip_bm_free_next_offset = le32(obj + SM_OFF(sm_ip_bm_free_next_offset));
+
+	/*
+	 * The counts have to agree with the geometry, the address array has to be inside the
+	 * object, and the one device has to be the container's: a manager that fails any of
+	 * these is one whose bitmaps would place a write anywhere.
+	 *
+	 * Where the structure ends depends on a flag: a versioned manager carries its own
+	 * reported size and the allocation zones, and without the flag those two fields are
+	 * simply absent -- the arrays begin right after the free-next offset (apfsck works
+	 * out the same two sizes, and the images here are of the unversioned shape).
+	 */
+	if (le32(obj + SM_OFF(sm_flags)) & APFS_SM_FLAG_VERSIONED) {
+		min = le32(obj + SM_OFF(sm_struct_size));
+		if (min < SM_OFF(sm_datazone) +
+		    (uint32_t)sizeof(struct apfs_spaceman_datazone_info_phys)) {
+			apfs_log("the space manager's reported size is too small\n");
+			goto out;
+		}
+	} else {
+		min = SM_OFF(sm_ip_bm_free_next_offset) + 4;
+	}
+	if (sm->block_size != nx->block_size || sm->blocks_per_chunk == 0 ||
+	    sm->blocks_per_chunk > sm->block_size * 8 || sm->chunks_per_cib == 0 ||
+	    sm->cibs_per_cab == 0 || sm->chunk_count == 0 || sm->cib_count == 0 ||
+	    min > size) {
+		apfs_log("the space manager's geometry makes no sense\n");
+		goto out;
+	}
+	if (sm->chunk_count != (sm->block_count + sm->blocks_per_chunk - 1) / sm->blocks_per_chunk ||
+	    sm->cib_count != (sm->chunk_count + sm->chunks_per_cib - 1) / sm->chunks_per_cib) {
+		apfs_log("the space manager's chunk counts do not add up\n");
+		goto out;
+	}
+	cabs = (sm->cib_count + sm->cibs_per_cab - 1) / sm->cibs_per_cab;
+	if (cabs == 1) {
+		cabs = 0;               /* one address block is no block at all: the array is used */
+	}
+	if (sm->cab_count != cabs) {
+		apfs_log("the space manager has %u address blocks, %u fit\n", sm->cab_count, cabs);
+		goto out;
+	}
+	entries = sm->cab_count != 0 ? sm->cab_count : sm->cib_count;
+	if (sm->addr_offset < min || (sm->addr_offset % 8) != 0 ||
+	    (uint64_t)sm->addr_offset + (uint64_t)entries * 8 > size) {
+		apfs_log("the space manager's address array is not inside it\n");
+		goto out;
+	}
+	if (sm->ip_bm_size_in_blocks == 0 || sm->ip_bm_block_count == 0 ||
+	    sm->ip_block_count == 0) {
+		apfs_log("the space manager's internal pool makes no sense\n");
+		goto out;
+	}
+	return 0;
+out:
+	apfs_free(obj, size);
+	return error;
+}
+
+void
+apfs_spaceman_close(struct apfs_spaceman *sm)
+{
+	if (sm->sm != NULL) {
+		apfs_free(sm->sm, sm->sm_size);
+	}
+	memset(sm, 0, sizeof(*sm));
+}
+
+/* Where the chunk-info block of a chunk-info block index is. */
+static int
+spaceman_cib_addr(struct apfs_spaceman *sm, uint32_t cib, uint64_t *out)
+{
+	const uint8_t *blk;
+	uint64_t cab_addr;
+	uint32_t cab, at, count;
+
+	*out = 0;
+	if (cib >= sm->cib_count) {
+		return EIO;
+	}
+	if (sm->cab_count == 0) {
+		*out = le64(sm->sm + sm->addr_offset + (size_t)cib * 8);
+		return *out == 0 ? EIO : 0;
+	}
+	cab = cib / sm->cibs_per_cab;
+	at = cib % sm->cibs_per_cab;
+	if (cab >= sm->cab_count) {
+		return EIO;
+	}
+	cab_addr = le64(sm->sm + sm->addr_offset + (size_t)cab * 8);
+	if (cab_addr == 0 || nx_block(sm->nx, cab_addr, &blk, true) != 0 ||
+	    obj_type(blk) != APFS_OBJECT_TYPE_SPACEMAN_CAB) {
+		return EIO;
+	}
+	count = le32(blk + 36);
+	if (at >= count || at > (sm->block_size - 40) / 8) {
+		return EIO;
+	}
+	*out = le64(blk + 40 + (size_t)at * 8);
+	return *out == 0 ? EIO : 0;
+}
+
+#define CI_SIZE ((uint32_t)sizeof(struct apfs_chunk_info))
+
+int
+apfs_spaceman_chunk(struct apfs_spaceman *sm, uint32_t index, struct apfs_chunk_info *ci)
+{
+	const uint8_t *blk, *e;
+	uint64_t cib_addr;
+	uint32_t cib, at, count;
+
+	if (index >= sm->chunk_count) {
+		return ENOENT;
+	}
+	cib = index / sm->chunks_per_cib;
+	at = index % sm->chunks_per_cib;
+	if (spaceman_cib_addr(sm, cib, &cib_addr) != 0 ||
+	    nx_block(sm->nx, cib_addr, &blk, true) != 0 ||
+	    obj_type(blk) != APFS_OBJECT_TYPE_SPACEMAN_CIB) {
+		apfs_log("chunk %u: its chunk-info block cannot be read\n", index);
+		return EIO;
+	}
+	count = le32(blk + 36);
+	if (count > (sm->block_size - 40) / CI_SIZE) {
+		count = (sm->block_size - 40) / CI_SIZE;
+	}
+	if (at >= count) {
+		apfs_log("chunk %u: its chunk-info block holds %u records\n", index, count);
+		return EIO;
+	}
+	e = blk + 40 + (size_t)at * CI_SIZE;
+	ci->ci_xid = le64(e);
+	ci->ci_addr = le64(e + 8);
+	ci->ci_block_count = le32(e + 16);
+	ci->ci_free_count = le32(e + 20);
+	ci->ci_bitmap_addr = le64(e + 24);
+	if (ci->ci_block_count == 0 || ci->ci_block_count > sm->blocks_per_chunk ||
+	    ci->ci_free_count > ci->ci_block_count ||
+	    (uint64_t)ci->ci_addr + ci->ci_block_count > sm->block_count) {
+		apfs_log("chunk %u: %u blocks at %llu makes no sense\n", index, ci->ci_block_count,
+		    (unsigned long long)ci->ci_addr);
+		return EIO;
+	}
+	return 0;
+}
+
+int
+apfs_spaceman_bitmap(struct apfs_spaceman *sm, const struct apfs_chunk_info *ci,
+    const uint8_t **bitmap)
+{
+	*bitmap = NULL;
+	if (ci->ci_bitmap_addr == 0) {
+		return 0;               /* the whole chunk is free */
+	}
+	if (nx_block(sm->nx, (uint64_t)ci->ci_bitmap_addr, bitmap, false) != 0) {
+		apfs_log("chunk at %llu: its bitmap cannot be read\n",
+		    (unsigned long long)ci->ci_addr);
+		return EIO;
+	}
+	return 0;
+}
+
+int
+apfs_spaceman_locate(struct apfs_spaceman *sm, uint64_t block, uint32_t *chunk,
+    uint32_t *bit)
+{
+	struct apfs_chunk_info ci;
+	uint32_t lo = 0, hi = sm->chunk_count;
+
+	while (lo < hi) {
+		uint32_t mid = lo + (hi - lo) / 2;
+
+		if (apfs_spaceman_chunk(sm, mid, &ci) != 0) {
+			return EIO;
+		}
+		if (block < (uint64_t)ci.ci_addr) {
+			hi = mid;
+		} else if (block >= (uint64_t)ci.ci_addr + ci.ci_block_count) {
+			lo = mid + 1;
+		} else {
+			*chunk = mid;
+			*bit = (uint32_t)(block - (uint64_t)ci.ci_addr);
+			return 0;
+		}
+	}
+	return ENOENT;
+}
+
+int
+apfs_spaceman_block_used(struct apfs_spaceman *sm, uint64_t block, bool *used)
+{
+	const uint8_t *bitmap;
+	struct apfs_chunk_info ci;
+	uint32_t chunk, bit;
+
+	*used = false;
+	if (apfs_spaceman_locate(sm, block, &chunk, &bit) != 0) {
+		return ENOENT;
+	}
+	if (apfs_spaceman_chunk(sm, chunk, &ci) != 0) {
+		return EIO;
+	}
+	if (apfs_spaceman_bitmap(sm, &ci, &bitmap) != 0) {
+		return EIO;
+	}
+	if (bitmap != NULL) {
+		*used = ((bitmap[bit >> 3] >> (bit & 7)) & 1) != 0;
+	}
+	return 0;
+}
+
 int
 apfs_vol_open(struct apfs_nx *nx, uint32_t index, struct apfs_vol *vol)
 {
@@ -1188,7 +1634,7 @@ apfs_vol_open(struct apfs_nx *nx, uint32_t index, struct apfs_vol *vol)
 	vol->nx = nx;
 	vol->index = index;
 	vol->oid = nx->fs_oid[index];
-	error = omap_find(&nx->omap, vol->oid, nx->xid, &addr);
+	error = omap_find(&nx->omap, vol->oid, nx->xid, &addr, NULL);
 	if (error) {
 		return error;
 	}
@@ -1201,6 +1647,7 @@ apfs_vol_open(struct apfs_nx *nx, uint32_t index, struct apfs_vol *vol)
 		    (unsigned long long)addr);
 		return EIO;
 	}
+	vol->sb_addr = addr;
 	vol->incompat = le64(blk + 56);
 	vol->alloc_count = le64(blk + 88);
 	er_type = le32(blk + 120);
@@ -1216,6 +1663,7 @@ apfs_vol_open(struct apfs_nx *nx, uint32_t index, struct apfs_vol *vol)
 	memcpy(vol->name, blk + 704, APFS_VOLNAME_LEN);
 	vol->name[APFS_VOLNAME_LEN - 1] = '\0';
 	vol->role = le16(blk + 964);
+	vol->id_floor = le64(blk + 176);        /* apfs_next_obj_id */
 	fext_oid = le64(blk + 0x408);           /* apfs_fext_tree_oid, apfs_fext_tree_type */
 	fext_type = le32(blk + 0x410);
 	vol->hashed_names = (vol->incompat & (APFS_INCOMPAT_CASE_INSENSITIVE |
@@ -1232,6 +1680,7 @@ apfs_vol_open(struct apfs_nx *nx, uint32_t index, struct apfs_vol *vol)
 		apfs_log("volume %u (%s) is encrypted\n", index, vol->name);
 		return ENOTSUP;
 	}
+	vol->omap_addr = omap_oid;
 	/* the volume's own map resolves the nodes of its file-system tree */
 	error = omap_open(nx, omap_oid, &vol->omap);
 	if (error) {
@@ -1240,6 +1689,29 @@ apfs_vol_open(struct apfs_nx *nx, uint32_t index, struct apfs_vol *vol)
 	error = btree_open(nx, &vol->omap, root_oid, &vol->tree);
 	if (error) {
 		return error;
+	}
+	/*
+	 * What a write may hand out starts above everything already named by either
+	 * tree, and above the counter the superblock carries.  On a clean image these
+	 * agree; after a commit that failed between its tree blocks and its superblock
+	 * they do not, and the next oid would then be one a live node already owns.
+	 * A tree we cannot read leaves the superblock's own value in place.
+	 */
+	{
+		uint64_t fsmax = 0, ommax = 0;
+
+		if (apfs_btree_max_key_oid(&vol->tree, &fsmax) == 0 && fsmax + 1 > vol->id_floor) {
+			vol->id_floor = fsmax + 1;
+		}
+		if (apfs_btree_max_key_oid(&vol->omap.tree, &ommax) == 0 && ommax + 1 > vol->id_floor) {
+			vol->id_floor = ommax + 1;
+		}
+		if (nx->sb != NULL && le64(nx->sb + 88) > vol->id_floor) {
+			vol->id_floor = le64(nx->sb + 88);
+		}
+		if (vol->id_floor < APFS_MIN_USER_INO_NUM) {
+			vol->id_floor = APFS_MIN_USER_INO_NUM;
+		}
 	}
 	if (fext_oid != 0) {
 		if ((fext_type & APFS_OBJ_STORAGETYPE_MASK) != APFS_OBJ_PHYSICAL) {
@@ -1319,6 +1791,7 @@ seek_to(struct apfs_btree *tree, const struct seek_target *t, struct apfs_cursor
 	cur->tree = tree;
 	error = node_at(tree, addr, &blk, &n);
 	if (error) {
+		apfs_log("seek_to %llu: root node_at %llu failed: %d\n", (unsigned long long)t->obj_id, (unsigned long long)addr, error);
 		return error;
 	}
 	cur->depth = 0;
@@ -1326,6 +1799,7 @@ seek_to(struct apfs_btree *tree, const struct seek_target *t, struct apfs_cursor
 		uint32_t i, pick = 0;
 
 		if (cur->depth >= APFS_MAX_LEVELS) {
+			apfs_log("seek_to %llu: depth %u >= MAX_LEVELS\n", (unsigned long long)t->obj_id, cur->depth);
 			return EIO;
 		}
 		cur->node[cur->depth] = addr;
@@ -1344,9 +1818,15 @@ seek_to(struct apfs_btree *tree, const struct seek_target *t, struct apfs_cursor
 
 				error = node_entry(tree, &n, mid, &k, &kl, &v, &vl);
 				if (error) {
+					apfs_log("seek_to %llu: node_entry %u failed: %d\n", (unsigned long long)t->obj_id, mid, error);
 					return error;
 				}
 				if (kl < 8) {
+					if (!n.leaf && mid == 0 && kl == 0) {
+						lo = mid + 1;
+						continue;
+					}
+					apfs_log("seek_to %llu: kl %u < 8\n", (unsigned long long)t->obj_id, kl);
 					return EIO;
 				}
 				if (seek_cmp(k, kl, t) < 0) {
@@ -1373,17 +1853,80 @@ seek_to(struct apfs_btree *tree, const struct seek_target *t, struct apfs_cursor
 
 			error = node_child_addr(tree, &n, pick, &addr, &h8);
 			if (error) {
+				apfs_log("seek_to %llu: node_child_addr pick %u error %d\n",
+				    (unsigned long long)t->obj_id, pick, error);
 				return error;
 			}
 			if (cur->depth + 1 >= APFS_MAX_LEVELS) {
+				apfs_log("seek_to %llu: max levels %u\n",
+				    (unsigned long long)t->obj_id, cur->depth);
 				return EIO;
 			}
 			cur->depth++;
 			cur->hash8[cur->depth] = h8;
 			error = node_at_h(tree, addr, h8, &blk, &n);
+			if (error) {
+				apfs_log("seek_to %llu: node_at_h %llu error %d\n",
+				    (unsigned long long)t->obj_id, (unsigned long long)addr, error);
+				return error;
+			}
 		}
 		if (error) {
 			return error;
+		}
+	}
+}
+
+/*
+ * The greatest object identifier any key of a tree names.  Every key of both trees a
+ * writer cares about -- the file-system tree and an object map -- begins with the
+ * oid, and a B-tree sorts by it, so the last key of the rightmost leaf is the answer.
+ * That is one path down the tree, not a walk of it: the mount can afford this on every
+ * open, and it is what keeps a new identifier above the records already there.
+ */
+int
+apfs_btree_max_key_oid(struct apfs_btree *tree, uint64_t *oid)
+{
+	const uint8_t *blk;
+	struct node n;
+	uint64_t addr = tree->root;
+	int error;
+
+	*oid = 0;
+	error = node_at(tree, addr, &blk, &n);
+	if (error) {
+		return error;
+	}
+	for (;;) {
+		if (n.nkeys == 0) {
+			return 0;
+		}
+		if (n.leaf) {
+			const uint8_t *k, *v;
+			uint16_t kl, vl;
+
+			error = node_entry(tree, &n, n.nkeys - 1, &k, &kl, &v, &vl);
+			if (error) {
+				return error;
+			}
+			if (kl < 8) {
+				return EIO;
+			}
+			/* an object map's key is the oid itself; a file-system key keeps its type above */
+			*oid = tree->key_size >= 16 ? le64(k) : jkey_id(k);
+			return 0;
+		}
+		{
+			uint64_t h8 = 0;
+
+			error = node_child_addr(tree, &n, n.nkeys - 1, &addr, &h8);
+			if (error) {
+				return error;
+			}
+			error = node_at_h(tree, addr, h8, &blk, &n);
+			if (error) {
+				return error;
+			}
 		}
 	}
 }
@@ -1532,15 +2075,19 @@ xfields_find(const uint8_t *buf, uint16_t len, uint8_t want, const uint8_t **out
 }
 
 int
-apfs_inode_get(struct apfs_vol *vol, uint64_t obj_id, struct apfs_inode *ino)
+apfs_inode_value_get(struct apfs_vol *vol, uint64_t obj_id, uint8_t *buf, size_t cap,
+    uint16_t *len)
 {
 	struct apfs_cursor cur;
 	struct apfs_rec rec;
-	const uint8_t *xf;
-	uint16_t xf_len;
 	int error;
 
-	memset(ino, 0, sizeof(*ino));
+	/*
+	 * Out of the tree the way apfs_inode_get() does it, cursor and all: the first key at or
+	 * after the target may be the *first* key of a leaf, which seek_to() reaches from the
+	 * leaf before it -- so scanning that one leaf alone finds nothing, and an inode record
+	 * that a split put at a leaf's edge was invisible to every writer after a reboot.
+	 */
 	error = apfs_seek(&vol->tree, obj_id, APFS_TYPE_INODE, &cur);
 	if (error) {
 		return error;
@@ -1552,7 +2099,44 @@ apfs_inode_get(struct apfs_vol *vol, uint64_t obj_id, struct apfs_inode *ino)
 	if (rec.obj_id != obj_id || rec.type != APFS_TYPE_INODE) {
 		return ENOENT;
 	}
+	if (rec.val_len > cap) {
+		return ENOSPC;
+	}
+	memcpy(buf, rec.val, rec.val_len);
+	*len = rec.val_len;
+	return 0;
+}
+
+int
+apfs_inode_get(struct apfs_vol *vol, uint64_t obj_id, struct apfs_inode *ino)
+{
+	struct apfs_cursor cur;
+	struct apfs_rec rec;
+	const uint8_t *xf;
+	uint16_t xf_len;
+	int error;
+
+	memset(ino, 0, sizeof(*ino));
+	error = apfs_seek(&vol->tree, obj_id, APFS_TYPE_INODE, &cur);
+	if (error) {
+		apfs_log("inode_get %llu: apfs_seek failed: %d\n",
+		    (unsigned long long)obj_id, error);
+		return error;
+	}
+	error = apfs_cursor_next(&cur, &rec);
+	if (error) {
+		apfs_log("inode_get %llu: cursor_next failed: %d\n",
+		    (unsigned long long)obj_id, error);
+		return error;
+	}
+	if (rec.obj_id != obj_id || rec.type != APFS_TYPE_INODE) {
+		apfs_log("inode_get %llu: mismatch: rec.obj_id %llu rec.type %u\n",
+		    (unsigned long long)obj_id, (unsigned long long)rec.obj_id, (unsigned)rec.type);
+		return ENOENT;
+	}
 	if (rec.val == NULL || rec.val_len < 92) {
+		apfs_log("inode_get %llu: short val: %u\n",
+		    (unsigned long long)obj_id, (unsigned)rec.val_len);
 		return EIO;
 	}
 	ino->obj_id = obj_id;
@@ -2358,6 +2942,42 @@ apfs_extent_at(struct apfs_vol *vol, uint64_t stream_id, uint64_t off,
 			ext->phys = phys;
 			return 0;
 		}
+	}
+}
+
+/*
+ * The first extent of a stream that reaches past `off`, whether it covers `off` or begins
+ * after it.  apfs_extent_at() answers about one offset and calls a gap between records
+ * damage; a sparse file has such gaps and this walks over them.
+ */
+int
+apfs_extent_next(struct apfs_vol *vol, uint64_t stream_id, uint64_t off,
+    struct apfs_extent *ext)
+{
+	struct ext_iter it;
+	uint64_t logical, length, phys;
+	int error;
+
+	error = ext_begin(vol, stream_id, off, &it);
+	if (error) {
+		return error;
+	}
+	for (;;) {
+		error = ext_next(&it, &logical, &length, &phys);
+		if (error) {
+			return error;
+		}
+		if (length == 0 || (length % vol->nx->block_size) != 0 ||
+		    (logical % vol->nx->block_size) != 0) {
+			return EIO;
+		}
+		if (logical + length <= off) {
+			continue;
+		}
+		ext->logical = logical;
+		ext->length = length;
+		ext->phys = phys;
+		return 0;
 	}
 }
 

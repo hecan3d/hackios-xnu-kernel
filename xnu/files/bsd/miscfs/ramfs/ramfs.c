@@ -27,6 +27,7 @@
 #include <kern/locks.h>
 #include <libkern/libkern.h>
 #include <mach/vm_param.h>
+#include <pexpert/pexpert.h>
 #include <sys/attr.h>
 #include <sys/dirent.h>
 #include <sys/errno.h>
@@ -1727,8 +1728,21 @@ ramfs_mount(mount_t mp, __unused vnode_t devvp, __unused user_addr_t data, __unu
 	lck_mtx_init(&rm->rm_lock, &ramfs_lck_grp, LCK_ATTR_NULL);
 	rm->rm_mp = mp;
 	rm->rm_next_ino = RAMFS_ROOT_INO + 1;
-	/* a runaway writer must not be able to take the whole machine: a quarter of memory at most */
-	rm->rm_max_pages = (max_mem / 4) / PAGE_SIZE;
+	/*
+	 * A runaway writer must not be able to take the whole machine: half of memory at most, and
+	 * ramfs_mb=N when a run wants a particular number.  A quarter was the default and gave the
+	 * phone's data volume 1 GB (max_mem / 4), which iOS shows in About and which fills up with
+	 * two applications' caches.
+	 */
+	{
+		int megabytes = 0;
+
+		if (PE_parse_boot_argn("ramfs_mb", &megabytes, sizeof(megabytes)) && megabytes > 0) {
+			rm->rm_max_pages = (uint64_t)megabytes * 1024 * 1024 / PAGE_SIZE;
+		} else {
+			rm->rm_max_pages = (max_mem / 2) / PAGE_SIZE;
+		}
+	}
 
 	rm->rm_hash = kalloc_type(struct ramfs_node *, RAMFS_HASH_SIZE, Z_WAITOK | Z_ZERO | Z_NOFAIL);
 	rm->rm_root = ramfs_node_alloc(rm, VDIR, NULL);

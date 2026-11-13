@@ -54,9 +54,10 @@ apfs_ticks(void)
 #include <sys/systm.h>
 #include <libkern/libkern.h>
 #include <kern/kalloc.h>
+#include <pexpert/pexpert.h>
 #define apfs_alloc(n)        kalloc_data((vm_size_t)(n), Z_WAITOK | Z_ZERO)
 #define apfs_free(p, n)      kfree_data((p), (vm_size_t)(n))
-#define apfs_log(...)        printf("apfs: " __VA_ARGS__)
+#define apfs_log(...)        kprintf("apfs: " __VA_ARGS__)
 #else
 #include <errno.h>
 #include <stdbool.h>
@@ -173,6 +174,7 @@ struct apfs_omap_hit {
 	uint64_t oid;                   /* 0: empty */
 	uint64_t xid;
 	uint64_t addr;
+	uint64_t key_xid;               /* the transaction the record's key names */
 };
 
 struct apfs_scratch;            /* apfs_lib.c's own */
@@ -196,6 +198,19 @@ struct apfs_nx {
 	 */
 	uint64_t          xp_desc_base, xp_data_base;
 	uint32_t          xp_desc_blocks, xp_data_blocks;
+	/*
+	 * The live container superblock itself, kept only when the device takes writes: a
+	 * transaction copies it, changes what it has to, and commits a new one.  NULL on a
+	 * read-only mount, and a writer refuses to begin without it.
+	 */
+	uint8_t          *sb;
+	/*
+	 * The extent of the rings the live checkpoint occupies: its descriptor blocks hold
+	 * the checkpoint map, and the map is how the ephemeral objects of that checkpoint --
+	 * the space manager among them -- are found in the data ring.
+	 */
+	uint32_t          xp_desc_next, xp_data_next;   /* where the next checkpoint goes */
+	uint32_t          xp_desc_index, xp_desc_len;
 	/*
 	 * The caller's lock round this container, which apfs_lib may let go of while it
 	 * does work that touches nothing shared -- reading a file's contents off the device
@@ -289,6 +304,8 @@ struct apfs_vol {
 	struct apfs_nx   *nx;
 	uint32_t          index;
 	apfs_oid_t        oid;
+	apfs_paddr_t      sb_addr;      /* where the volume superblock is now */
+	apfs_paddr_t      omap_addr;    /* and its object map, a physical object */
 	uint64_t          incompat;
 	uint64_t          fs_flags;
 	uint16_t          role;
@@ -324,6 +341,15 @@ struct apfs_vol {
 	uint64_t          num_dirs;
 	uint64_t          num_symlinks;
 	uint64_t          alloc_count;
+	/*
+	 * The first object identifier this mount may hand out.  apfs_next_obj_id in the
+	 * volume superblock says the same on a clean image, but a commit that failed
+	 * after its tree blocks were written leaves the superblock behind the tree.
+	 * A create would then reuse an oid that a live B-tree node already owns, the
+	 * node's entry in the object map would be shadowed, and part of the tree would
+	 * stop being reachable.  Never below anything either tree already names.
+	 */
+	uint64_t          id_floor;
 	char              name[APFS_VOLNAME_LEN];
 	struct apfs_omap  omap;         /* resolves the nodes of the tree below */
 	struct apfs_btree tree;         /* the file-system tree */
@@ -460,6 +486,11 @@ void apfs_nx_close(struct apfs_nx *nx);
 bool apfs_name_hash(const char *name, size_t name_len, bool fold, uint32_t *hash);
 /* Free the retired blocks' memory no operation that began at `oldest` or later can see (lock held) */
 void apfs_nx_reclaim(struct apfs_nx *nx, uint64_t oldest);
+
+/* The cached copy of a block, gone: the transaction that wrote it calls this for each. */
+void apfs_nx_cache_drop(struct apfs_nx *nx, uint64_t addr);
+
+extern const char *apfs_where;    /* debug only */
 #ifndef KERNEL
 /* For tests on the build machine: every cached block out (retired, with a caller's lock), so all is read again */
 void apfs_nx_cache_flush(struct apfs_nx *nx);
@@ -481,6 +512,9 @@ int apfs_seek(struct apfs_btree *tree, uint64_t obj_id, uint8_t type,
     struct apfs_cursor *cur);
 int apfs_cursor_next(struct apfs_cursor *cur, struct apfs_rec *rec);
 
+/* The greatest object identifier any key of a tree names: its rightmost leaf. */
+int apfs_btree_max_key_oid(struct apfs_btree *tree, uint64_t *oid);
+
 /* ---- what the records mean ---- */
 
 /*
@@ -490,6 +524,24 @@ int apfs_cursor_next(struct apfs_cursor *cur, struct apfs_rec *rec);
  * apfs_inode_size() where the size reported to a caller has to be right.
  */
 int apfs_inode_get(struct apfs_vol *vol, uint64_t obj_id, struct apfs_inode *ino);
+
+/*
+ * The raw value of an inode record: what a writer copies and changes, so that the
+ * extended fields it does not understand (the name, the data stream) stay as they
+ * are.  ENOENT when there is no such record, ENOSPC when the caller's buffer is
+ * too small.
+ */
+int apfs_inode_value_get(struct apfs_vol *vol, uint64_t obj_id, uint8_t *buf,
+    size_t cap, uint16_t *len);
+
+/* An object map's answer for one identifier at one transaction: the block. */
+int apfs_omap_lookup(struct apfs_omap *omap, apfs_oid_t oid, apfs_xid_t xid,
+    uint64_t *addr);
+
+/* The same, and the transaction of the record's key: a writer needs it to retire the record
+ * the new one replaces. */
+int apfs_omap_lookup_key(struct apfs_omap *omap, apfs_oid_t oid, apfs_xid_t xid,
+    uint64_t *addr, apfs_xid_t *key_xid);
 
 /*
  * The logical size of a file: the uncompressed size for a compressed one, the length of
@@ -553,6 +605,8 @@ int apfs_read_stream(struct apfs_vol *vol, uint64_t stream_id, uint64_t stream_s
  */
 int apfs_extent_at(struct apfs_vol *vol, uint64_t stream_id, uint64_t off,
     struct apfs_extent *ext);
+int apfs_extent_next(struct apfs_vol *vol, uint64_t stream_id, uint64_t off,
+    struct apfs_extent *ext);
 
 /*
  * Open the volume's extent-reference tree into `tree`, which is the caller's to keep for as
@@ -583,6 +637,220 @@ int apfs_read_file(struct apfs_vol *vol, const struct apfs_inode *ino,
  * block.  ENOENT otherwise (compressed, in pieces, empty).
  */
 int apfs_file_in_place(struct apfs_vol *vol, const struct apfs_inode *ino, uint64_t *addr);
+
+/* ---- odds and ends a writer needs ---- */
+
+/*
+ * A block of metadata through the cache, its checksum verified.  The pointer is into the
+ * cache and stays good for fewer further reads than APFS_CACHE_RECENT, so a writer copies
+ * what it means to change.  EIO for an address outside the container or a block that does
+ * not check out.
+ */
+int apfs_block_read(struct apfs_nx *nx, uint64_t addr, const uint8_t **block);
+
+/*
+ * The same without the checksum, for the blocks that are not objects: a chunk's bitmap and
+ * the internal pool's are plain bits from their first byte, with no header to check.
+ */
+int apfs_block_read_raw(struct apfs_nx *nx, uint64_t addr, const uint8_t **block);
+
+/* ---- the space manager ---- */
+
+/*
+ * A container's space manager, read out of its checkpoint.  Nothing holds a pointer into
+ * the cached blocks it came from: the object is copied into memory of its own (the
+ * checkpoint data ring may be reused by the next transaction, and a writer will rewrite
+ * this object rather than read it again), and the chunk-info blocks are read one at a time
+ * as chunks are asked for.
+ */
+#define APFS_SM_MAX_MAPS 16     /* the ephemeral objects of one checkpoint */
+
+struct apfs_sm_map {
+	uint32_t   type;                /* storage class in the high half, type in the low */
+	uint32_t   subtype;
+	uint32_t   size;
+	apfs_oid_t oid;
+	uint64_t   paddr;               /* where it lies in the checkpoint data ring */
+};
+
+struct apfs_spaceman {
+	struct apfs_nx *nx;
+	uint8_t        *sm;             /* the whole object, sm_size bytes */
+	uint32_t        sm_size;
+	uint32_t        block_size;
+	uint32_t        blocks_per_chunk;
+	uint32_t        chunks_per_cib;
+	uint32_t        cibs_per_cab;
+	uint64_t        block_count;    /* of device 0, the only one this port has */
+	uint32_t        chunk_count;
+	uint32_t        cib_count;
+	uint32_t        cab_count;
+	uint64_t        free_count;     /* what the space manager says is free */
+	uint32_t        addr_offset;    /* of the chunk-info (or address-block) array */
+	uint64_t        ip_block_count;
+	uint64_t        ip_bm_base;
+	uint64_t        ip_base;
+	uint32_t        ip_bm_size_in_blocks;
+	uint32_t        ip_bm_block_count;
+	uint32_t        ip_bm_xid_offset;
+	uint32_t        ip_bitmap_offset;
+	uint32_t        ip_bm_free_next_offset;
+	uint16_t        ip_bm_free_head;
+	uint16_t        ip_bm_free_tail;
+	apfs_xid_t      xid;            /* the transaction the object belongs to */
+	/* the checkpoint map the object came from: the ephemeral objects a commit copies */
+	uint32_t        map_count;
+	struct apfs_sm_map map[APFS_SM_MAX_MAPS];
+};
+
+/* ---- transactions (apfs_txn.c) ---- */
+
+struct apfs_txn;
+
+/*
+ * A transaction being built: the blocks it will write are held until it commits, in the order
+ * a crash has to survive.  NULL when the device does not take writes.  apfs_txn_abort() gives
+ * back everything a transaction holds and is safe on NULL.
+ */
+struct apfs_txn *apfs_txn_begin(struct apfs_nx *nx, struct apfs_spaceman *sm);
+void apfs_txn_abort(struct apfs_txn *txn);
+
+/*
+ * Write everything, in order, the container superblock last; then block zero.  On an error
+ * some of it may have gone out: what a reader sees is still one whole checkpoint, either the
+ * one before or the one this meant to make.
+ */
+int apfs_txn_commit(struct apfs_txn *txn);
+
+/*
+ * The modification time of one inode, as a transaction.  The file-system tree, the volume's
+ * object map and the container's have to be one node each -- ENOENT when there is no such
+ * inode, ENOTSUP when a tree is deeper than that, EROFS when the volume may not be written.
+ */
+int apfs_inode_set_mod_time(struct apfs_vol *vol, uint64_t obj_id, uint64_t when);
+
+/*
+ * An empty file, and a file taken away: the records of the file-system tree, the
+ * volume's object map and the superblocks, committed as one transaction.  The
+ * file's data, and a directory, are not here yet.
+ */
+int apfs_create_file(struct apfs_vol *vol, uint64_t parent, const char *name,
+    uint16_t mode, uint32_t owner, uint32_t group, uint64_t when, uint64_t *new_id);
+int apfs_unlink(struct apfs_vol *vol, uint64_t parent, const char *name,
+    uint64_t when);
+/* the last name of a file that is still open: zero links, the file kept for the reader */
+int apfs_unlink_keep(struct apfs_vol *vol, uint64_t parent, const char *name, uint64_t when);
+/* its end, at the last close: the inode, its extents, its attributes */
+int apfs_delete_inode(struct apfs_vol *vol, uint64_t obj_id, uint64_t when);
+
+/*
+ * Append to a file's data stream.  The blocks are new, the file-extent record and its entry in
+ * the extent-reference tree are new, and the inode's data stream grows.  Appending only, and
+ * only at a block boundary: writing inside a file's existing blocks is apfs_write.c's job and
+ * touches no structure.
+ */
+int apfs_append_file(struct apfs_vol *vol, uint64_t obj_id, const void *buf, size_t len,
+    uint64_t when);
+int apfs_write_data(struct apfs_vol *vol, uint64_t obj_id, uint64_t off, const void *buf,
+    size_t len, uint64_t when);
+
+/* A directory, and how it goes away: empty first, as on any Unix. */
+int apfs_mkdir(struct apfs_vol *vol, uint64_t parent, const char *name, uint16_t mode,
+    uint32_t owner, uint32_t group, uint64_t when, uint64_t *new_id);
+int apfs_rmdir(struct apfs_vol *vol, uint64_t parent, const char *name, uint64_t when);
+
+/*
+ * Rename: the entry `name` in `parent` becomes `new_name` in `new_parent`; the file keeps
+ * its identifier, its blocks and its data stream.  EEXIST when the new name is taken by
+ * another file, ENOTDIR when the new parent is not a directory, EINVAL for a directory
+ * moved inside itself.
+ */
+int apfs_rename(struct apfs_vol *vol, uint64_t parent, const char *name, uint64_t new_parent,
+    const char *new_name, uint64_t when);
+int apfs_link(struct apfs_vol *vol, uint64_t parent, const char *name, uint64_t obj_id,
+    uint64_t when);
+
+/*
+ * Cut a file short: the extents past the new size go back to the space manager, the one the
+ * file ends in keeps only its blocks that are still used, and the data stream says the new
+ * size.  Growing is not this; EINVAL for a size larger than the file's, EISDIR for a
+ * directory.
+ */
+int apfs_truncate(struct apfs_vol *vol, uint64_t obj_id, uint64_t size, uint64_t when);
+
+/*
+ * An extended attribute, set or taken away.  The value is embedded in the record
+ * (APFS_XATTR_MAX_EMBEDDED_SIZE at most); a value with a stream of its own is not made here.
+ * `flags` are the caller's own bits; APFS_XATTR_DATA_EMBEDDED is set and
+ * APFS_XATTR_DATA_STREAM is refused.  ENOENT when removing one that is not there.
+ */
+int apfs_setxattr(struct apfs_vol *vol, uint64_t obj_id, const char *name, const void *data,
+    size_t len, uint16_t flags, uint64_t when);
+int apfs_removexattr(struct apfs_vol *vol, uint64_t obj_id, const char *name, uint64_t when);
+
+/*
+ * Attributes of an inode that setattr may change: which of them is in effect is said by the
+ * flags, so that a caller changing the mode does not have to know (or keep) the owner.
+ * The identifier, the parent and the data stream are not here: those are the operations
+ * that move them.
+ */
+struct apfs_setattr {
+	bool     mode_set;
+	uint16_t mode;
+	bool     owner_set;
+	uint32_t owner;
+	bool     group_set;
+	uint32_t group;
+	bool     flags_set;
+	uint32_t bsd_flags;
+	bool     atime_set;
+	uint64_t atime;
+	bool     mtime_set;
+	uint64_t mtime;
+};
+
+int apfs_inode_setattr(struct apfs_vol *vol, uint64_t obj_id,
+    const struct apfs_setattr *sa, uint64_t when);
+
+#ifndef KERNEL
+/*
+ * A check of the extended-field re-packing, for the host tests: rebuild an inode's record
+ * from the values it already has, report whether the bytes came out the same, and put the
+ * rebuilt record back through a transaction when they did.
+ */
+int apfs_inode_repack_check(struct apfs_vol *vol, uint64_t obj_id, bool *same,
+    uint64_t when);
+#endif
+
+/*
+ * Read the container's space manager.  *sm is the caller's; apfs_spaceman_close() gives
+ * back what it holds.  An error here (EIO for a structure that does not check out, ENOENT
+ * when the checkpoint map names no space manager) means the container cannot be written.
+ */
+int apfs_spaceman_open(struct apfs_nx *nx, struct apfs_spaceman *sm);
+void apfs_spaceman_close(struct apfs_spaceman *sm);
+
+/*
+ * One chunk: where it begins, how many blocks it holds, how many are free, and the block
+ * its bitmap is in (0 when the chunk is entirely free).  ENOENT past the last chunk.
+ */
+int apfs_spaceman_chunk(struct apfs_spaceman *sm, uint32_t index, struct apfs_chunk_info *ci);
+
+/*
+ * A chunk's bitmap: one bit per block of the chunk, in the block the chunk-info record
+ * names, read from offset 0 (it is not an object: no header, no checksum).  The pointer is
+ * into the block cache and stays good for fewer further reads than APFS_CACHE_RECENT; NULL
+ * when every block of the chunk is free.  ENOENT for a chunk with no bitmap at all.
+ */
+int apfs_spaceman_bitmap(struct apfs_spaceman *sm, const struct apfs_chunk_info *ci,
+    const uint8_t **bitmap);
+
+/* Is that block in use, as the bitmaps say?  ENOENT when it is outside every chunk. */
+int apfs_spaceman_block_used(struct apfs_spaceman *sm, uint64_t block, bool *used);
+
+/* The chunk a block belongs to, and its index in that chunk's bitmap. */
+int apfs_spaceman_locate(struct apfs_spaceman *sm, uint64_t block, uint32_t *chunk,
+    uint32_t *bit);
 
 /* ---- odds and ends worth testing on their own ---- */
 

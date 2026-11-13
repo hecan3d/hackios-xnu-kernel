@@ -156,6 +156,27 @@ loader_log_put_locked(char c)
 	}
 }
 
+/*
+ * Throw the log away: what comes after this is what the loader will bring back, and the first
+ * 32 KB of it are all that comes back over USB.  init calls it before it hands process 1 to
+ * launchd, so that the ignition and whatever the system says on its way down are in that window.
+ */
+static void loader_log_reset_msgbuf(void);
+
+void
+loader_log_reset(void)
+{
+	uint64_t daif = __builtin_arm_rsr64("DAIF");
+
+	__builtin_arm_wsr("DAIFSet", DAIFSC_IRQF | DAIFSC_FIQF);
+	loader_log_linear = true;               /* plain appending, from the start */
+	loader_log_len = 0;
+	loader_log_ring_at = 0;
+	loader_log_wrapped = false;
+	loader_log_reset_msgbuf();              /* and the kernel's own buffer, or it comes back too */
+	__builtin_arm_wsr64("DAIF", daif);
+}
+
 /* Oldest first: the head, a note about what was dropped, then the ring from its oldest character. */
 static void
 loader_log_linearize(void)
@@ -339,6 +360,17 @@ struct msgbuf {
 	char *msg_bufc;         /* buffer */
 };
 extern struct msgbuf *msgbufp;
+
+/* The message buffer is appended to the log on the way out; leaving it is why a reset did not
+ * hide the boot: what printf() wrote before it came back anyway. */
+static void
+loader_log_reset_msgbuf(void)
+{
+	if (msgbufp != NULL && msgbufp->msg_bufc != NULL && msgbufp->msg_size > 0) {
+		msgbufp->msg_bufx = 0;
+		msgbufp->msg_bufr = 0;
+	}
+}
 
 static void
 loader_log_puts(const char *s)
