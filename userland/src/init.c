@@ -665,6 +665,50 @@ own_tree(const char *path, int uid)
  * and shared. What dpkg and apt write over rather than beside (their databases and settings) is
  * copied for real: GRAFT_COPY below.
  */
+/*
+ * A directory and a link, made so that a graft can be run again over the one an earlier boot left.
+ * /private/var is on the phone's flash now, and what the graft makes there stays: mkdir found the
+ * directory of the last boot and the graft of every boot after the first stopped at the first call
+ * ("0 directories, 0 files and links").  A name that is in the way as something else -- a link
+ * where a directory belongs -- is taken away and made again.
+ */
+static int
+make_directory(const char *path, int mode)
+{
+	struct stat st;
+
+	if (mkdir(path, mode) == 0) {
+		return 1;
+	}
+	if (errno != 17 /* EEXIST: the mini runtime has no header for it */) {
+		return 0;
+	}
+	if (lstat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR) {
+		return 1;
+	}
+	return unlink(path) == 0 && mkdir(path, mode) == 0;
+}
+
+static int
+make_link(const char *from, const char *to)
+{
+	char target[512];
+	ssize_t length;
+
+	if (symlink(from, to) == 0) {
+		return 1;
+	}
+	if (errno != 17 /* EEXIST: the mini runtime has no header for it */) {
+		return 0;
+	}
+	length = readlink(to, target, sizeof(target) - 1);
+	target[length > 0 ? length : 0] = 0;
+	if (length > 0 && strcmp(target, from) == 0) {
+		return 1;
+	}
+	return unlink(to) == 0 && symlink(from, to) == 0;
+}
+
 static int
 copy_tree(const char *from, const char *to, int *files)
 {
@@ -679,7 +723,7 @@ copy_tree(const char *from, const char *to, int *files)
 		return 0;
 	}
 	mode = st.st_mode & 07777;
-	if (mkdir(to, mode) != 0 || chown(to, 0, 0) != 0) {
+	if (!make_directory(to, mode) || chown(to, 0, 0) != 0) {
 		return 0;
 	}
 	if ((fd = open(from, O_RDONLY | O_DIRECTORY, 0)) < 0) {
@@ -711,7 +755,7 @@ copy_tree(const char *from, const char *to, int *files)
 				ssize_t length = readlink(f, target, sizeof(target) - 1);
 
 				target[length > 0 ? length : 0] = 0;
-				ok = length > 0 && symlink(target, t) == 0;
+				ok = length > 0 && make_link(target, t);
 				(*files)++;
 			} else {
 				ok = copy_file(f, t, st.st_mode & 07777, 0, 0);
@@ -743,7 +787,7 @@ graft_tree(const char *from, const char *to, int top, int *made, int *linked)
 		return 0;
 	}
 	mode = st.st_mode & 07777;
-	if (mkdir(to, mode) != 0 || chown(to, 0, 0) != 0) {
+	if (!make_directory(to, mode) || chown(to, 0, 0) != 0) {
 		return 0;
 	}
 	(*made)++;
@@ -779,7 +823,7 @@ graft_tree(const char *from, const char *to, int top, int *made, int *linked)
 			} else if ((st.st_mode & S_IFMT) == S_IFDIR) {
 				ok = graft_tree(f, t, 0, made, linked);
 			} else {
-				ok = symlink(f, t) == 0;
+				ok = make_link(f, t);
 				(*linked)++;
 			}
 			if (!ok) {
@@ -789,6 +833,36 @@ graft_tree(const char *from, const char *to, int top, int *made, int *linked)
 	}
 	close(fd);
 	return ok && chmod(to, mode) == 0;
+}
+
+/* The names in a directory, said on one line: what a directory holds is the first question about
+ * anything the system makes there, and there is no ls in this init. */
+static void
+say_names(const char *path)
+{
+	static char entries[4096];
+	off_t position = 0;
+	ssize_t n;
+	int fd = open(path, O_RDONLY | O_DIRECTORY, 0);
+
+	printf("  %s:", path);
+	while (fd >= 0 && (n = getdirentries(fd, entries, sizeof(entries), &position)) > 0) {
+		for (ssize_t at = 0; at < n;) {
+			struct dirent *de = (struct dirent *)(entries + at);
+
+			if (de->d_reclen == 0) {
+				break;
+			}
+			at += de->d_reclen;
+			if (de->d_name[0] != '.') {
+				printf(" %s", de->d_name);
+			}
+		}
+	}
+	printf("\n");
+	if (fd >= 0) {
+		close(fd);
+	}
 }
 
 /*
@@ -856,6 +930,26 @@ mount_writable(void)
 		if (ok) {
 			printf("  /private/var: the APFS volume %s\n", spec);
 			check(1, "mount the data volume on /private/var");
+			{
+				/* statfs(2) by number: the mini runtime has no struct statfs of its own */
+				static char sf[2168];
+				long result = mini_syscall(157 /* statfs */, (long)"/private/var", (long)sf, 0, 0, 0, 0);
+
+				if (result == 0) {
+					int bsize = *(int *)sf;
+					long long blocks = *(long long *)(sf + 8);
+					long long bfree = *(long long *)(sf + 16);
+					long long bavail = *(long long *)(sf + 24);
+					long long files = *(long long *)(sf + 32);
+					long long ffree = *(long long *)(sf + 40);
+
+					printf("  the volume says: bsize %d, %lld blocks (%lld MB), %lld free, "
+					    "%lld available, %lld files, %lld free files\n", bsize, blocks,
+					    blocks * bsize >> 20, bfree, bavail, files, ffree);
+				} else {
+					printf("  statfs /private/var: %ld\n", result);
+				}
+			}
 		} else {
 			printf("  mount %s on /private/var: %s; the memory filesystem instead\n", spec,
 			    strerror(errno));
@@ -867,6 +961,29 @@ mount_writable(void)
 			printf("  mount: %s\n", strerror(errno));
 		}
 		check(ok, "mount a memory filesystem on /private/var");
+	}
+
+	/*
+	 * /var and /private/var: on the system volume /var is a link to private/var, and assetsd asks
+	 * for the photo library under /var/mobile/Media/PhotoData while the same directory answers
+	 * under /private/var/mobile/Media/PhotoData.  Say which of the two names reaches it here, so
+	 * that "The file PhotoData doesn't exist" has somewhere to point.
+	 */
+	{
+		static char link[256];
+		static char var_said[96], private_said[96];
+		struct stat at;
+		ssize_t length = lstat("/var", &at) == 0 && (at.st_mode & S_IFMT) == S_IFLNK ?
+		    readlink("/var", link, sizeof(link) - 1) : -1;
+
+		if (length > 0) {
+			link[length] = 0;
+		}
+		strcpy(var_said, stat("/var/mobile/Media/PhotoData", &at) == 0 ? "ok" : strerror(errno));
+		strcpy(private_said, stat("/private/var/mobile/Media/PhotoData", &at) == 0 ? "ok" :
+		    strerror(errno));
+		printf("  /var is %s; PhotoData: /var %s, /private/var %s\n",
+		    length > 0 ? link : "not a link to private/var", var_said, private_said);
 	}
 
 	/* the directories of the data volume, as listed in the template that ships with iOS (sysimage/mkvarskel.py) */
@@ -930,6 +1047,45 @@ mount_writable(void)
 	}
 	printf("  %d directories, %d files\n", made, files);
 	check(ok && made > 50, "create the directories of the data volume");
+
+	/*
+	 * The wallpaper's daemon (PosterBoard) keeps the active poster and its snapshots somewhere
+	 * under the user's Library, and on this volume it has to make what it needs at every boot,
+	 * which is why the wallpaper is black for the first seconds.  Names only, so the next boot
+	 * can put the right directory in place (p342).
+	 */
+	say_names("/private/var/mobile/Library");
+
+	/*
+	 * Where PosterBoard actually keeps the posters (p342: it opened
+	 * "/var/mobile/Library/Application Support/PRBPosterExtensionDataStore" by that name): what
+	 * is in there at boot says whether a rendered poster survives to the next boot, which is what
+	 * would make the wallpaper appear at once instead of forty seconds after the home screen.
+	 */
+	say_names("/private/var/mobile/Library/Application Support/PRBPosterExtensionDataStore");
+	say_names("/private/var/mobile/Library/Application Support/PRBPosterExtensionDataStore/59");
+
+	/*
+	 * Settings -> About showed the serial as RD00POCn3d: the last three characters are the ones
+	 * the device tree carries (mi9thecan3d), the first eight are not.  MobileGestalt keeps what
+	 * it read in its own container, and a kept answer is what a changed device tree would have
+	 * to get past, so the cache is thrown away at every boot while that is being worked out.
+	 */
+	{
+		static const char *const caches =
+		    "/private/var/containers/Shared/SystemGroup/"
+		    "systemgroup.com.apple.mobilegestaltcache/Library/Caches";
+		char at[320];
+
+		say_names(caches);
+		strcpy(at, caches);
+		strcpy(at + strlen(at), "/com.apple.MobileGestalt.plist");
+		if (unlink(at) == 0) {
+			printf("  mobilegestalt: the kept answer is thrown away\n");
+		} else {
+			printf("  mobilegestalt: %s: %s\n", at, strerror(errno));
+		}
+	}
 
 	/*
 	 * scan_probe=1: where the time goes when a directory is walked.  The fallback for
@@ -1007,6 +1163,103 @@ mount_writable(void)
 	}
 
 	/*
+	 * write_probe=1: what one small file costs on this volume.  LaunchServices builds its store
+	 * on /private/var and the container manager makes a container per application; if a commit
+	 * costs a second, that is the whole difference against RAM (p287: 4.6 file calls a second
+	 * against 194).
+	 */
+	if (boot_arg("write_probe") != NULL) {
+		const char *dir = "/private/var/tmp";
+		char path[128];
+		char payload[4096];
+		struct timeval t0, t1;
+		int round;
+		long total = 0;
+
+		strcpy(path, dir);
+		strcpy(path + strlen(path), "/write-probe");
+		for (round = 0; round < 10; round++) {
+			int wfd;
+			long usec;
+			unsigned i;
+
+			for (i = 0; i < sizeof(payload); i++) {
+				payload[i] = (char)(i * 31 + round);
+			}
+			gettimeofday(&t0, NULL);
+			wfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			if (wfd >= 0) {
+				write(wfd, payload, sizeof(payload));
+				fsync(wfd);
+				close(wfd);
+			}
+			gettimeofday(&t1, NULL);
+			usec = (t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_usec - t0.tv_usec);
+			total += usec;
+			printf("  write probe %d: %ld us\n", round, usec);
+		}
+		printf("  write probe: 10 files of 4096 bytes, %ld us in all\n", total);
+	}
+
+	/*
+	 * read_probe=1: what a read that really goes to the device costs.  The page cache answers the
+	 * second read of a file, so the file is opened with F_NOCACHE; the library's photo database is
+	 * always there and large enough to measure, and the write probe's file is the fallback.
+	 */
+	if (boot_arg("read_probe") != NULL) {
+		static const char *const paths[] = { "/private/var/mobile/Media/PhotoData/Photos.sqlite",
+			"/private/var/tmp/write-probe" };
+		static char buffer[262144];
+		struct timeval t0, t1;
+		unsigned long long usec, bytes = 0;
+		ssize_t n;
+		off_t size;
+		int fd = -1;
+		unsigned i;
+
+		for (i = 0; i < sizeof(paths) / sizeof(paths[0]) && fd < 0; i++) {
+			fd = open(paths[i], O_RDONLY, 0);
+		}
+		if (fd < 0) {
+			printf("  read probe: nothing to read: %s\n", strerror(errno));
+		} else {
+			mini_syscall(92 /* fcntl */, fd, 48 /* F_NOCACHE */, 1, 0, 0, 0);
+			printf("  read probe: %s, uncached\n", paths[i - 1]);
+			gettimeofday(&t0, NULL);
+			for (int round = 0; round < 4; round++) {
+				lseek(fd, 0, 0);
+				while ((n = read(fd, buffer, sizeof(buffer))) > 0) {
+					bytes += (unsigned long long)n;
+				}
+			}
+			gettimeofday(&t1, NULL);
+			usec = (unsigned long long)(t1.tv_sec - t0.tv_sec) * 1000000ULL +
+			    (unsigned long long)(t1.tv_usec - t0.tv_usec);
+			printf("  read probe: %llu bytes sequentially in %llu us: %lld KB/s\n", bytes, usec,
+			    usec != 0 ? (long long)(bytes / 1024 * 1000000ULL / usec) : -1);
+			size = lseek(fd, 0, 2);
+			lseek(fd, 0, 0);
+			bytes = 0;
+			gettimeofday(&t0, NULL);
+			for (i = 0; i < 400 && size > 4096; i++) {
+				off_t where = (off_t)(((unsigned long long)i * 2654435761ULL) %
+				    (unsigned long long)(size - 4096));
+
+				n = pread(fd, buffer, 4096, where);
+				if (n > 0) {
+					bytes += (unsigned long long)n;
+				}
+			}
+			gettimeofday(&t1, NULL);
+			usec = (unsigned long long)(t1.tv_sec - t0.tv_sec) * 1000000ULL +
+			    (unsigned long long)(t1.tv_usec - t0.tv_usec);
+			printf("  read probe: 400 random 4 KB in %llu us (%llu us each), %llu bytes read\n",
+			    usec, i != 0 ? usec / i : 0, bytes);
+			close(fd);
+		}
+	}
+
+	/*
 	 * cryptex_apps=1: LaunchServices on a real data volume keeps asking for
 	 * /System/Cryptexes/App/System/Applications (p281/p286: every one to five seconds, and it
 	 * never appears -- the image has only Library there), while in RAM it never looks.  The
@@ -1025,6 +1278,66 @@ mount_writable(void)
 	}
 
 	/*
+	 * hide_app=NAME: an empty memory filesystem over /Applications/NAME.app, so that the system
+	 * does not see that application at all.  Settings builds its list by asking each installed
+	 * application's settings bundle, and the Podcasts one (PodcastsUI) traps in this port --
+	 * which takes the whole Settings application with it.  Hiding the bundle is enough: no
+	 * record, no settings pane, no trap.
+	 */
+	{
+		const char *hidden = boot_arg("hide_app");
+
+		if (hidden != NULL && hidden[0] != 0) {
+			const char *at = join("/Applications/", hidden, ".app");
+
+			if (mount("ramfs", at, 0, NULL) == 0) {
+				check(1, "an application hidden from the system");
+				printf("  hidden: %s\n", at);
+			} else {
+				printf("  mount ramfs on %s: %s\n", at, strerror(errno));
+			}
+		}
+	}
+
+	/*
+	 * /redwood/etc/hide.paths: one path a line, each covered by an empty memory filesystem, for
+	 * what is not an application in /Applications.  Settings -> General -> iPhone Storage asks
+	 * every installed application's usage plugin for its size, and the Podcasts one
+	 * (PreferenceBundles/StoragePlugins/PodcastsUsagePlugin.bundle, built on PodcastsUI) traps in
+	 * this port and takes Settings with it.  Hiding the application does not help: the plugin
+	 * lives on the system volume and the store still lists the application.
+	 */
+	{
+		static char list[2048];
+
+		if (read_whole("/redwood/etc/hide.paths", list, sizeof(list)) > 0) {
+			const char *line = list;
+
+			while (line != NULL && line[0] != 0) {
+				const char *end = strchr(line, '\n');
+				size_t length = end != NULL ? (size_t)(end - line) : strlen(line);
+
+				if (length > 0) {
+					char path[256];
+
+					if (length >= sizeof(path)) {
+						length = sizeof(path) - 1;
+					}
+					memcpy(path, line, length);
+					path[length] = 0;
+					if (mount("ramfs", path, 0, NULL) == 0) {
+						check(1, "a path hidden from the system");
+						printf("  hidden: %s\n", path);
+					} else {
+						printf("  mount ramfs on %s: %s\n", path, strerror(errno));
+					}
+				}
+				line = end != NULL ? end + 1 : NULL;
+			}
+		}
+	}
+
+	/*
 	 * mcm_db_ram=1: the container manager's own database in memory.  On the APFS data volume
 	 * every SQLite write it makes costs it a second (p285: 0.3-2 s per container query, 4-6 ms
 	 * in RAM), and LaunchServices asks it once per application while building its store, which
@@ -1039,6 +1352,25 @@ mount_writable(void)
 			check(1, "the container manager's database in memory");
 		} else {
 			printf("  mount ramfs on %s: %s\n", db, strerror(errno));
+		}
+	}
+
+	/*
+	 * containers_ram=1: the whole container tree in memory, not only the manager's database.
+	 * The store build asks the container manager about every bundle, and on the APFS volume
+	 * each of those answers costs 0.3-2 s (p285/p299) while every single file call is instant
+	 * -- so the seconds are in the tree itself.  This says whether the tree is the cost: with
+	 * it in memory the store should build in a minute, as in RAM, and the price is that the
+	 * containers (and the store) are gone after a reboot.
+	 */
+	if (boot_arg("containers_ram") != NULL) {
+		const char *at = "/private/var/containers";
+
+		mkdir(at, 0755);
+		if (mount("ramfs", at, 0, NULL) == 0) {
+			check(1, "the container tree in memory");
+		} else {
+			printf("  mount ramfs on %s: %s\n", at, strerror(errno));
 		}
 	}
 
@@ -1067,7 +1399,7 @@ mount_writable(void)
 		 */
 		if (strcmp(jb, "/private/preboot/jb") == 0 && stat("/private/preboot/jb-rw", &st) == 0) {
 			if (mount("ramfs", "/private/preboot/jb-rw", 0, NULL) == 0 &&
-			    symlink("/private/preboot/jb-rw/procursus", "/private/var/jb") == 0) {
+			    make_link("/private/preboot/jb-rw/procursus", "/private/var/jb")) {
 				to = "/private/preboot/jb-rw/procursus";
 			} else {
 				printf("  the prefix on /private/preboot/jb-rw: %s\n", strerror(errno));
@@ -1125,6 +1457,40 @@ mount_writable(void)
 		printf("  /var/jb from %s, in %s: %d directories, %d files and links%s\n", jb, to, dirs, entries,
 		    users ? ", users resolvable" : "");
 		check(grafted, "graft the package manager's prefix onto the data volume");
+		/*
+		 * /redwood/etc/hakios.shellprobe: does the prefix's own shell run here at all?  NewTerm's
+		 * shell dies on its first start and does not start on the second, while the application
+		 * itself lives; the same binary run from here says whether the prefix, the libraries or
+		 * the terminal is what fails, and its output comes out on this console.
+		 */
+		if (stat("/redwood/etc/hakios.shellprobe", &st) == 0) {
+			static const char *const tries[] = { "/var/jb/bin/sh", "/jb/bin/sh",
+				"/var/jb/usr/bin/login", "/var/jb/usr/bin/zsh" };
+
+			for (unsigned i = 0; i < sizeof(tries) / sizeof(tries[0]); i++) {
+				printf("  shell probe: %s: %s\n", tries[i],
+				    stat(tries[i], &st) == 0 ? "here" : strerror(errno));
+			}
+			{
+				char *argv[] = { "/var/jb/bin/sh", "-c",
+					"echo SHELL-SAYS-HI; id; echo PATH=$PATH", NULL };
+				char *envp[] = { "PATH=/var/jb/bin:/var/jb/usr/bin:/usr/bin:/bin",
+					"HOME=/var/mobile", NULL };
+				int status = 0;
+				pid_t pid = fork();
+
+				if (pid == 0) {
+					execve(argv[0], argv, envp);
+					printf("  shell probe: execve: %s\n", strerror(errno));
+					_exit(127);
+				}
+				if (pid > 0 && wait4(pid, &status, 0, NULL) == pid) {
+					printf("  shell probe: status %#x (exit %d, term %d)\n",
+					    (unsigned)status, WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+					    status & 0x7f);
+				}
+			}
+		}
 	}
 }
 

@@ -37,7 +37,34 @@
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <os/lock.h>
+#include <pthread.h>
+#include <mach/mach_time.h>
+typedef void *xpc_connection_t_sb;
+typedef void *xpc_object_t_sb;
+typedef void (^xpc_handler_t_sb)(xpc_object_t_sb);
+extern const char *xpc_connection_get_name(xpc_connection_t_sb connection);
+extern xpc_object_t_sb xpc_connection_send_message_with_reply_sync(xpc_connection_t_sb connection, xpc_object_t_sb message);
+extern void xpc_connection_send_message_with_reply(xpc_connection_t_sb connection, xpc_object_t_sb message,
+    dispatch_queue_t replyq, xpc_handler_t_sb handler);
+extern xpc_connection_t_sb xpc_connection_create_mach_service(const char *name, dispatch_queue_t targetq, uint64_t flags);
+extern xpc_connection_t_sb xpc_connection_create(const char *name, dispatch_queue_t targetq);
+extern int xpc_connection_get_pid(xpc_connection_t_sb connection);
+extern int proc_name(int pid, void *buffer, uint32_t buffersize);
+extern char *xpc_copy_description(xpc_object_t_sb object);
+extern xpc_object_t_sb xpc_dictionary_get_value(xpc_object_t_sb object, const char *key);
+extern const void *xpc_data_get_bytes_ptr(xpc_object_t_sb object);
+extern size_t xpc_data_get_length(xpc_object_t_sb object);
+static void say_graph(const char *what, xpc_object_t_sb message);
+static void say_apfs_stats(const char *when);
+extern xpc_connection_t_sb xpc_connection_create_from_endpoint(xpc_object_t_sb endpoint);
+extern void xpc_connection_send_message(xpc_connection_t_sb connection, xpc_object_t_sb message);
+extern void xpc_connection_set_event_handler(xpc_connection_t_sb connection, xpc_handler_t_sb handler);
+extern void xpc_connection_resume(xpc_connection_t_sb connection);
 #include <notify.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -49,9 +76,15 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/ucontext.h>
 
 /* where what is said goes: the standard error, which is the console's for SpringBoard (an application's is nowhere) */
 static int say_fd = 2;
+
+/* Boot-arg sb_loud=N: how many XPC requests are written down with their reply and time
+ * (the first 250 by default). */
+static unsigned xpc_loud_limit = 250;
 
 static void
 say(const char *format, ...)
@@ -67,6 +100,104 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(say_fd, line, (size_t)n);
+}
+
+extern const void *_dyld_get_shared_cache_range(size_t *length);
+#define CACHE_BASE 0x180000000UL
+static uintptr_t slide;
+#include "collection_safety.h"
+
+static void
+say_the_fault(int signal_number, siginfo_t *info, void *context_in)
+{
+	ucontext_t *context = context_in;
+	uintptr_t pc = 0, lr = 0;
+
+	if (context != NULL && context->uc_mcontext != NULL) {
+		pc = (uintptr_t)context->uc_mcontext->__ss.__pc;
+		lr = (uintptr_t)context->uc_mcontext->__ss.__lr;
+	}
+	char frames[8 * 20 + 1] = "";
+	size_t used = 0;
+	uintptr_t fp = context != NULL && context->uc_mcontext != NULL ? (uintptr_t)context->uc_mcontext->__ss.__fp : 0;
+
+	for (unsigned i = 0; i < 8 && fp != 0 && (fp & 7) == 0; i++) {
+		uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
+
+		if (ret == 0) {
+			break;
+		}
+		used += (size_t)snprintf(frames + used, sizeof(frames) - used, " %#lx", ret - slide);
+		fp = next > fp ? next : 0;
+	}
+	say("hakios: %s[%d]: signal %d at %p, pc %#lx, lr %#lx, called from%s (unslid)\n",
+	    getprogname(), getpid(), signal_number,
+	    info != NULL ? info->si_addr : NULL, pc - slide, lr - slide, frames);
+	signal(signal_number, SIG_DFL);
+	raise(signal_number);
+}
+
+static void
+watch_for_faults(void)
+{
+	struct sigaction action;
+
+	memset(&action, 0, sizeof(action));
+	action.sa_sigaction = say_the_fault;
+	action.sa_flags = SA_SIGINFO | SA_RESETHAND;
+	sigaction(SIGSEGV, &action, NULL);
+	sigaction(SIGBUS, &action, NULL);
+	sigaction(SIGABRT, &action, NULL);
+	sigaction(SIGILL, &action, NULL);
+	sigaction(SIGTRAP, &action, NULL);
+}
+
+void
+__assert_rtn(const char *func, const char *file, int line, const char *expr)
+{
+	say("hakios: %s[%d]: ASSERT FAILED: %s (%s:%d in %s)\n",
+	    getprogname(), getpid(), expr ? expr : "?", file ? file : "?", line, func ? func : "?");
+	abort();
+}
+
+void
+abort(void)
+{
+	uintptr_t fp = (uintptr_t)__builtin_frame_address(0);
+	char frames[8 * 20 + 1] = "";
+	size_t used = 0;
+
+	for (unsigned i = 0; i < 8 && fp != 0 && (fp & 7) == 0; i++) {
+		uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
+
+		if (ret == 0) {
+			break;
+		}
+		used += (size_t)snprintf(frames + used, sizeof(frames) - used, " %#lx", ret - slide);
+		fp = next > fp ? next : 0;
+	}
+	say("hakios: %s[%d]: abort() called from %p (unslid %#lx), stack:%s\n",
+	    getprogname(), getpid(), __builtin_return_address(0),
+	    (uintptr_t)__builtin_return_address(0) - slide, frames);
+	signal(SIGABRT, SIG_DFL);
+	raise(SIGABRT);
+	for (;;) {}
+}
+
+static void
+hakios_exception_handler(id exception)
+{
+	Class cls = object_getClass(exception);
+	SEL sel_name = sel_registerName("name");
+	SEL sel_reason = sel_registerName("reason");
+	Method m_name = cls ? class_getInstanceMethod(cls, sel_name) : NULL;
+	Method m_reason = cls ? class_getInstanceMethod(cls, sel_reason) : NULL;
+	id name = (m_name && exception) ? ((id (*)(id, SEL))method_getImplementation(m_name))(exception, sel_name) : NULL;
+	id reason = (m_reason && exception) ? ((id (*)(id, SEL))method_getImplementation(m_reason))(exception, sel_reason) : NULL;
+	const char *c_name = name ? ((const char *(*)(id, SEL))class_getMethodImplementation(object_getClass(name), sel_registerName("UTF8String")))(name, sel_registerName("UTF8String")) : "?";
+	const char *c_reason = reason ? ((const char *(*)(id, SEL))class_getMethodImplementation(object_getClass(reason), sel_registerName("UTF8String")))(reason, sel_registerName("UTF8String")) : "?";
+
+	say("hakios: %s[%d]: UNCAUGHT EXCEPTION: %s: %s\n", getprogname(), getpid(), c_name, c_reason);
 }
 
 /*
@@ -126,11 +257,7 @@ watch_main_loop(void)
 
 /* ---- methods of SpringBoard's classes, replaced --------------------------------------------------- */
 
-extern const void *_dyld_get_shared_cache_range(size_t *length);
-
-#define CACHE_BASE 0x180000000UL                /* where the cache was built to be, before the slide */
-
-static uintptr_t slide;
+/* (CACHE_BASE and slide defined above) */
 
 /*
  * Replace -[CLASS SELECTOR] (or +[CLASS SELECTOR]: `kind` is that first character), whose code must now
@@ -771,6 +898,56 @@ unlock(void)
 }
 
 /*
+ * Boot-arg sb_unlock=N: after N seconds the lock screen is asked to unlock, three times fifteen
+ * seconds apart (the manager may not be there the first time).  p227/p228: the lock screen with its
+ * two "Waiting..." widgets is on the screen by the eighth minute, and the display goes black by the
+ * eleventh; this is to see what is behind the lock screen, and whether "swipe up" works at all.
+ */
+static unsigned unlock_after;
+
+static void *
+unlock_later(void *unused)
+{
+	int i;
+
+	(void)unused;
+	sleep(unlock_after);
+	for (i = 0; i < 3; i++) {
+		dispatch_async(dispatch_get_main_queue(), ^{
+			unlock();
+		});
+		sleep(15);
+	}
+	return NULL;
+}
+
+static void
+unlock_setup(void)
+{
+	char arguments[2048] = "";
+	size_t size = sizeof(arguments) - 1;
+	const char *at;
+	pthread_t th;
+
+	arguments[0] = 0;
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+		return;
+	}
+	at = strstr(arguments, "sb_unlock=");
+	if (at == NULL) {
+		return;
+	}
+	unlock_after = (unsigned)strtoul(at + 10, NULL, 10);
+	if (unlock_after < 30 || unlock_after > 900) {
+		return;
+	}
+	say("hakios: unlock: the lock screen is asked to unlock at %u s\n", unlock_after);
+	if (pthread_create(&th, NULL, unlock_later, NULL) == 0) {
+		pthread_detach(th);
+	}
+}
+
+/*
  * The poster switcher: on iOS 16 a long press on the lock screen's wallpaper shrinks it into a
  * row of posters to choose from or customize. The row is PosterBoard's, an application scene of
  * that process which the lock screen hosts (CSPosterSwitcherViewController, a CALayerHost of the
@@ -1234,16 +1411,2156 @@ control_center_fades(const char *arguments)
 static void
 load_tweaks(void)
 {
-	struct stat st;
+	say("hakios: tweaks: disabled for early boot\n");
+	return;
+}
 
-	if (stat("/var/jb/usr/lib/TweakInject", &st) != 0) {
-		return;                 /* no package manager's prefix here, so no tweaks */
+/* ---- startup milestones: the last one in the log is where SpringBoard stops ---- */
+
+#define HOOK_INIT(clsname)                                                         \
+	static id (*orig_init_##clsname)(id, SEL);                                     \
+	static id log_init_##clsname(id self, SEL sel)                                 \
+	{                                                                              \
+		say("hakios: SB milestone: -[%s init]\n", #clsname);                     \
+		return orig_init_##clsname(self, sel);                                      \
+	}                                                                              \
+	static void hook_init_##clsname(Class c)                                       \
+	{                                                                              \
+		Method m = c ? class_getInstanceMethod(c, sel_registerName("init")) : NULL; \
+		if (m != NULL) {                                                            \
+			orig_init_##clsname = (void *)method_getImplementation(m);               \
+			method_setImplementation(m, (IMP)log_init_##clsname);                    \
+		}                                                                          \
 	}
-	if (dlopen(HAKIOS_TWEAK_LOADER, RTLD_NOW | RTLD_GLOBAL) == NULL) {
-		say("hakios: the tweak loader %s: %s\n", HAKIOS_TWEAK_LOADER, dlerror());
+
+#define HOOK_VOID(clsname, selname)                                                \
+	static void (*orig_void_##clsname)(id, SEL);                                    \
+	static void log_void_##clsname(id self, SEL sel)                                \
+	{                                                                              \
+		say("hakios: SB milestone: -[%s %s]\n", #clsname, #selname);               \
+		if (orig_void_##clsname != NULL) { orig_void_##clsname(self, sel); }        \
+	}                                                                              \
+	static void hook_void_##clsname(Class c)                                        \
+	{                                                                              \
+		Method m = c ? class_getInstanceMethod(c, sel_registerName(#selname)) : NULL; \
+		if (m != NULL) {                                                            \
+			orig_void_##clsname = (void *)method_getImplementation(m);               \
+			method_setImplementation(m, (IMP)log_void_##clsname);                    \
+		}                                                                          \
+	}
+
+HOOK_INIT(SBUIController)
+HOOK_INIT(SBApplicationController)
+HOOK_INIT(SBLockScreenManager)
+HOOK_INIT(SBWallpaperController)
+HOOK_INIT(SBMainWorkspace)
+HOOK_INIT(SBUserSessionController)
+HOOK_VOID(SBApplicationController, _loadApplications)
+HOOK_VOID(SBUIController, _bootComplete)
+
+
+/* ---- where it stops, asked of its own threads ------------------------------------------------ */
+
+static const char *
+image_of(uintptr_t address, uintptr_t *offset)
+{
+	uint32_t count = _dyld_image_count();
+	uint32_t i;
+
+	for (i = 0; i < count; i++) {
+		const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(i);
+		intptr_t aslide = _dyld_get_image_vmaddr_slide(i);
+		const struct load_command *command;
+		uint32_t j;
+
+		if (header == NULL || header->magic != MH_MAGIC_64) {
+			continue;
+		}
+		command = (const struct load_command *)(header + 1);
+		for (j = 0; j < header->ncmds && command->cmdsize >= sizeof(*command); j++) {
+			if (command->cmd == LC_SEGMENT_64) {
+				const struct segment_command_64 *segment = (const struct segment_command_64 *)command;
+				uintptr_t base = (uintptr_t)segment->vmaddr + (uintptr_t)aslide;
+
+				if (address >= base && address < base + (uintptr_t)segment->vmsize) {
+					*offset = address - base;
+					return _dyld_get_image_name(i);
+				}
+			}
+			command = (const struct load_command *)((const char *)command + command->cmdsize);
+		}
+	}
+	return NULL;
+}
+
+static void
+sample_one(unsigned index, thread_t thread)
+{
+	arm_thread_state64_t state;
+	mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
+	struct thread_basic_info basic;
+	mach_msg_type_number_t basic_count = THREAD_BASIC_INFO_COUNT;
+	int run_state = -1;
+	uintptr_t offset;
+	const char *image;
+	unsigned frame;
+	uintptr_t fp;
+
+	if (thread_info(thread, THREAD_BASIC_INFO, (thread_info_t)&basic, &basic_count) == KERN_SUCCESS) {
+		run_state = basic.run_state;
+	}
+	if (thread_get_state(thread, ARM_THREAD_STATE64, (thread_state_t)&state, &state_count) != KERN_SUCCESS) {
+		say("hakios: Sample t%u: no state (run %d)\n", index, run_state);
+		return;
+	}
+	fp = (uintptr_t)arm_thread_state64_get_fp(state);
+	image = image_of((uintptr_t)arm_thread_state64_get_pc(state), &offset);
+	if (image != NULL) {
+		say("hakios: Sample t%u run %d pc %s+%#lx\n", index, run_state, image, (unsigned long)offset);
 	} else {
-		say("hakios: tweaks: %s opened\n", HAKIOS_TWEAK_LOADER);
+		say("hakios: Sample t%u run %d pc %#lx\n", index, run_state,
+		    (unsigned long)arm_thread_state64_get_pc(state));
 	}
+	image = image_of((uintptr_t)arm_thread_state64_get_lr(state), &offset);
+	if (image != NULL) {
+		say("hakios: Sample t%u   lr %s+%#lx\n", index, image, (unsigned long)offset);
+	}
+	for (frame = 0; frame < 8 && fp != 0 && (fp & 7) == 0; frame++) {
+		struct { uintptr_t next, ret; } pair;
+		vm_size_t got = 0;
+
+		if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, sizeof(pair),
+		    (vm_address_t)&pair, &got) != KERN_SUCCESS || got != sizeof(pair)) {
+			break;
+		}
+		if (pair.ret == 0) {
+			break;
+		}
+		image = image_of(pair.ret, &offset);
+		if (image != NULL) {
+			say("hakios: Sample t%u   from %s+%#lx\n", index, image, (unsigned long)offset);
+		}
+		if (pair.next <= fp) {
+			break;
+		}
+		fp = pair.next;
+	}
+}
+
+/*
+ * Boot-arg sb_layers=N[,M]: the layer tree of SpringBoard is written down at those seconds (the
+ * sampler's own times: 15, 40, 70, 110, 170, 280).  The screen stays black through a whole run while
+ * the controllers are all made -- this says whether there is a window to show at all, and whether
+ * the user counts as authenticated, without a Darwin notification from the host.
+ */
+static void
+layers_at(int seconds)
+{
+	char arguments[2048];
+	size_t size = sizeof(arguments) - 1;
+	const char *at;
+	int first = 0, second = 0;
+
+	arguments[0] = 0;
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+		return;
+	}
+	at = strstr(arguments, "sb_layers=");
+	if (at == NULL) {
+		return;
+	}
+	first = (int)strtol(at + 10, NULL, 10);
+	{
+		char *end = NULL;
+
+		second = (int)strtol(at + 10, &end, 10);
+		if (end != NULL && *end == ',') {
+			second = (int)strtol(end + 1, NULL, 10);
+		}
+	}
+	if (first != seconds && second != seconds) {
+		return;
+	}
+	say("hakios: layers: asked at %d s\n", seconds);
+	/*
+	 * On the main thread: p218 called this from the sampler thread and SpringBoard died of
+	 * SIGTRAP (EXC_BREAKPOINT) right there, with four windows already counted -- the window
+	 * server's objects are not to be read off the main thread.
+	 */
+	dispatch_async(dispatch_get_main_queue(), ^{
+		layers();
+	});
+}
+
+static void
+sample_threads(int seconds)
+{
+	thread_act_array_t threads = NULL;
+	mach_msg_type_number_t count = 0;
+	mach_port_t me = mach_task_self();
+	unsigned i;
+
+	say("hakios: Sample: %d s after start\n", seconds);
+	say_apfs_stats("at the sample");
+	if (task_threads(me, &threads, &count) != KERN_SUCCESS) {
+		say("hakios: Sample: task_threads refused\n");
+		return;
+	}
+	for (i = 0; i < count; i++) {
+		sample_one(i, threads[i]);
+	}
+	for (i = 0; i < count; i++) {
+		mach_port_deallocate(me, threads[i]);
+	}
+	vm_deallocate(me, (vm_address_t)threads, count * sizeof(threads[0]));
+}
+
+static void *
+sampler(void *unused)
+{
+	static const int at[] = { 15, 40, 70, 110, 170, 280 };
+	unsigned i;
+	int now = 0;
+
+	(void)unused;
+	for (i = 0; i < sizeof(at) / sizeof(at[0]); i++) {
+		sleep((unsigned)(at[i] - now));
+		now = at[i];
+		sample_threads(now);
+		layers_at(now);
+	}
+	return NULL;
+}
+
+static void
+loud_limit_setup(void)
+{
+	char arguments[2048] = "";
+	size_t size = sizeof(arguments) - 1;
+	const char *at;
+
+	arguments[0] = 0;
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+		return;
+	}
+	at = strstr(arguments, "sb_loud=");
+	if (at != NULL) {
+		unsigned long n = strtoul(at + 8, NULL, 10);
+
+		if (n >= 250 && n <= 100000) {
+			xpc_loud_limit = (unsigned)n;
+			say("hakios: xpc: the first %lu requests are written down with their time\n", n);
+		}
+	}
+}
+
+static void
+sample_watchdog(void)
+{
+	pthread_t th;
+
+	if (pthread_create(&th, NULL, sampler, NULL) == 0) {
+		pthread_detach(th);
+	}
+}
+
+
+/* ---- what it waits for, by watching the calls that can wait ---------------------------------- */
+
+static int xpc_watched;
+static unsigned xpc_count;
+
+static unsigned long long
+millis_now(void)
+{
+	static mach_timebase_info_data_t base;
+	uint64_t now = mach_absolute_time();
+
+	if (base.denom == 0) {
+		mach_timebase_info(&base);
+	}
+	return (unsigned long long)(now * base.numer / base.denom / 1000000ULL);
+}
+
+static const char *
+peer_of(xpc_connection_t_sb connection, char *text, size_t size)
+{
+	int pid = xpc_connection_get_pid(connection);
+	const char *name = xpc_connection_get_name(connection);
+
+	if (name != NULL) {
+		snprintf(text, size, "%s", name);
+	} else if (pid > 0) {
+		char program[64] = "";
+
+		proc_name(pid, program, sizeof(program));
+		snprintf(text, size, "(no name) pid %d %s", pid, program);
+	} else {
+		snprintf(text, size, "(no name) pid 0");
+	}
+	return text;
+}
+
+static void
+say_frames(const char *what, uintptr_t frame, unsigned depth)
+{
+	unsigned i;
+
+	for (i = 0; i < depth && frame != 0 && (frame & 7) == 0; i++) {
+		struct { uintptr_t next, ret; } pair;
+		vm_size_t got = 0;
+		uintptr_t offset = 0;
+		const char *image;
+
+		if (vm_read_overwrite(mach_task_self(), (vm_address_t)frame, sizeof(pair),
+		    (vm_address_t)&pair, &got) != KERN_SUCCESS || got != sizeof(pair)) {
+			break;
+		}
+		if (pair.ret == 0) {
+			break;
+		}
+		image = image_of(pair.ret, &offset);
+		if (image != NULL) {
+			say("hakios: %s   #%u %s+%#lx\n", what, i, image, (unsigned long)offset);
+		}
+		if (pair.next <= frame) {
+			break;
+		}
+		frame = pair.next;
+	}
+}
+
+/* ---- unfair locks: who holds the one the main thread waits for ------------------------------- */
+
+/*
+ * SpringBoard's main thread spends its life in __ulock_wait inside CoreServices: an unfair lock
+ * of LaunchServices is taken by another thread and never given back (p133, p188, p192).  A sample
+ * of the process says the main thread waits; it says nothing about the owner, because the owner
+ * is between two syscalls at the moment of the sample.  So the lock itself is watched: every
+ * acquire is recorded with the thread that owns it, a wait longer than half a second is said with
+ * both stacks, and a lock held longer than three seconds is said by a watchdog even when nobody
+ * is waiting on it yet.
+ */
+static void (*orig_lock)(os_unfair_lock_t);
+static void (*orig_unlock)(os_unfair_lock_t);
+
+struct lock_slot {
+	os_unfair_lock_t lock;
+	pthread_t owner;
+	unsigned long long since;
+	int reported;
+	unsigned held;
+};
+
+#define LOCK_SLOTS 256
+static struct lock_slot lock_slots[LOCK_SLOTS];
+static pthread_mutex_t lock_slots_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+lock_slot_take(os_unfair_lock_t lock, pthread_t owner)
+{
+	unsigned i;
+	int free_slot = -1;
+
+	pthread_mutex_lock(&lock_slots_mutex);
+	for (i = 0; i < LOCK_SLOTS; i++) {
+		if (lock_slots[i].lock == lock) {
+			free_slot = (int)i;
+			break;
+		}
+		if (free_slot < 0 && lock_slots[i].lock == NULL) {
+			free_slot = (int)i;
+		}
+	}
+	if (free_slot >= 0) {
+		if (lock_slots[free_slot].lock == lock) {
+			lock_slots[free_slot].held++;
+		} else {
+			lock_slots[free_slot].held = 1;
+		}
+		lock_slots[free_slot].lock = lock;
+		lock_slots[free_slot].owner = owner;
+		lock_slots[free_slot].since = millis_now();
+		lock_slots[free_slot].reported = 0;
+	}
+	pthread_mutex_unlock(&lock_slots_mutex);
+}
+
+static void
+lock_slot_clear(os_unfair_lock_t lock)
+{
+	unsigned i;
+
+	pthread_mutex_lock(&lock_slots_mutex);
+	for (i = 0; i < LOCK_SLOTS; i++) {
+		if (lock_slots[i].lock == lock) {
+			if (lock_slots[i].held > 1) {
+				lock_slots[i].held--;
+			} else {
+				lock_slots[i].lock = NULL;
+				lock_slots[i].owner = NULL;
+				lock_slots[i].since = 0;
+				lock_slots[i].reported = 0;
+				lock_slots[i].held = 0;
+			}
+		}
+	}
+	pthread_mutex_unlock(&lock_slots_mutex);
+}
+
+static pthread_t
+lock_slot_owner(os_unfair_lock_t lock, unsigned long long *since)
+{
+	pthread_t owner = NULL;
+	unsigned i;
+
+	pthread_mutex_lock(&lock_slots_mutex);
+	for (i = 0; i < LOCK_SLOTS; i++) {
+		if (lock_slots[i].lock == lock) {
+			owner = lock_slots[i].owner;
+			if (since != NULL) {
+				*since = lock_slots[i].since;
+			}
+			break;
+		}
+	}
+	pthread_mutex_unlock(&lock_slots_mutex);
+	return owner;
+}
+
+static void
+say_thread_stack(const char *tag, pthread_t who, unsigned depth)
+{
+	arm_thread_state64_t state;
+	mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+	thread_t thread;
+	uintptr_t fp, offset;
+	const char *image;
+	unsigned frame;
+
+	if (who == NULL) {
+		say("hakios: lock %s: no thread\n", tag);
+		return;
+	}
+	thread = pthread_mach_thread_np(who);
+	if (thread == THREAD_NULL ||
+	    thread_get_state(thread, ARM_THREAD_STATE64, (thread_state_t)&state, &count) != KERN_SUCCESS) {
+		say("hakios: lock %s: no state\n", tag);
+		return;
+	}
+	image = image_of((uintptr_t)arm_thread_state64_get_pc(state), &offset);
+	if (image != NULL) {
+		say("hakios: lock %s: pc %s+%#lx", tag, image, (unsigned long)offset);
+	} else {
+		say("hakios: lock %s: pc %#lx", tag, (unsigned long)arm_thread_state64_get_pc(state));
+	}
+	image = image_of((uintptr_t)arm_thread_state64_get_lr(state), &offset);
+	if (image != NULL) {
+		say(" lr %s+%#lx\n", image, (unsigned long)offset);
+	} else {
+		say(" lr %#lx\n", (unsigned long)arm_thread_state64_get_lr(state));
+	}
+	fp = (uintptr_t)arm_thread_state64_get_fp(state);
+	for (frame = 0; frame < depth && fp != 0 && (fp & 7) == 0; frame++) {
+		struct { uintptr_t next, ret; } pair;
+		vm_size_t got = 0;
+
+		if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, sizeof(pair),
+		    (vm_address_t)&pair, &got) != KERN_SUCCESS || got != sizeof(pair) ||
+		    pair.ret == 0) {
+			break;
+		}
+		image = image_of(pair.ret, &offset);
+		if (image != NULL) {
+			say("hakios: lock %s:   from %s+%#lx\n", tag, image, (unsigned long)offset);
+		} else {
+			say("hakios: lock %s:   from %#lx\n", tag, (unsigned long)pair.ret);
+		}
+		if (pair.next <= fp) {
+			break;
+		}
+		fp = pair.next;
+	}
+}
+
+static void
+said_lock_wait(os_unfair_lock_t lock, unsigned long long started, pthread_t previous)
+{
+	unsigned long long waited = millis_now() - started;
+
+	if (waited < 500) {
+		return;
+	}
+	say("hakios: lock %p: waited %llu ms\n", lock, waited);
+	say_frames("waiter", (uintptr_t)__builtin_frame_address(0), 10);
+	if (previous != NULL) {
+		say_thread_stack("owner", previous, 12);
+	}
+}
+
+static void
+hk_lock(os_unfair_lock_t lock)
+{
+	unsigned long long t0 = millis_now();
+	pthread_t previous = lock_slot_owner(lock, NULL);
+
+	orig_lock(lock);
+	lock_slot_take(lock, pthread_self());
+	said_lock_wait(lock, t0, previous);
+}
+
+static void
+hk_unlock(os_unfair_lock_t lock)
+{
+	lock_slot_clear(lock);
+	orig_unlock(lock);
+}
+
+#define LOCK_INTERPOSE(ours, theirs)                                                     \
+	__attribute__((used)) static struct {                                             \
+		const void *replacement, *replacee;                                        \
+	} lock_interpose_##theirs __attribute__((section("__DATA,__interpose"))) = {     \
+		(const void *)(ours), (const void *)(theirs)                               \
+	}
+
+LOCK_INTERPOSE(hk_lock, os_unfair_lock_lock);
+LOCK_INTERPOSE(hk_unlock, os_unfair_lock_unlock);
+
+/*
+ * The interpose above could not be installed (libsystem_platform's symbols are not to be had
+ * through dlsym in this port: RTLD_NEXT answers with our own hook and the library is not
+ * openable by path).  So the lock is read instead of watched: the main thread, when it waits,
+ * is inside __ulock_wait with the address of the lock word in x0, and the word itself says which
+ * thread owns it (the contended value is (thread id << 1) | 1).  Every 250 ms the main thread is
+ * looked at; when it is on a lock, the owner is found among the process's threads and its stack
+ * is printed -- that is the answer to "who holds LaunchServices' lock".
+ */
+static thread_t main_thread_port;
+static uint64_t main_thread_tid;
+
+static void
+lock_sampler_start(void)
+{
+	main_thread_port = mach_thread_self();
+	if (pthread_threadid_np(NULL, &main_thread_tid) != 0) {
+		main_thread_tid = 0;
+	}
+}
+
+static uint64_t
+tid_of(thread_t thread)
+{
+	struct thread_identifier_info info;
+	mach_msg_type_number_t count = THREAD_IDENTIFIER_INFO_COUNT;
+
+	if (thread_info(thread, THREAD_IDENTIFIER_INFO, (thread_info_t)&info, &count) != KERN_SUCCESS) {
+		return 0;
+	}
+	return info.thread_id;
+}
+
+static void
+say_owner_of(uint64_t tid, uint32_t word, uintptr_t lock_address)
+{
+	thread_act_array_t threads = NULL;
+	mach_msg_type_number_t count = 0;
+	unsigned i;
+
+	say("hakios: lock: main waits on %p (word %#x, owner tid %llu)\n", (void *)lock_address,
+	    word, (unsigned long long)tid);
+	if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
+		return;
+	}
+	for (i = 0; i < count; i++) {
+		if (tid_of(threads[i]) == tid) {
+			{
+				arm_thread_state64_t state;
+				mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
+				uintptr_t fp, offset;
+				const char *image;
+				unsigned frame;
+
+				if (thread_get_state(threads[i], ARM_THREAD_STATE64,
+				    (thread_state_t)&state, &state_count) == KERN_SUCCESS) {
+					image = image_of((uintptr_t)arm_thread_state64_get_pc(state),
+					    &offset);
+					say("hakios: lock owner: pc %s+%#lx\n",
+					    image != NULL ? image : "?",
+					    image != NULL ? (unsigned long)offset : 0UL);
+					fp = (uintptr_t)arm_thread_state64_get_fp(state);
+					for (frame = 0; frame < 14 && fp != 0 && (fp & 7) == 0;
+					    frame++) {
+						struct { uintptr_t next, ret; } pair;
+						vm_size_t got = 0;
+
+						if (vm_read_overwrite(mach_task_self(),
+						    (vm_address_t)fp, sizeof(pair),
+						    (vm_address_t)&pair,
+						    &got) != KERN_SUCCESS || got != sizeof(pair) ||
+						    pair.ret == 0) {
+							break;
+						}
+						image = image_of(pair.ret, &offset);
+						if (image != NULL) {
+							say("hakios: lock owner:   from %s+%#lx\n",
+							    image, (unsigned long)offset);
+						}
+						if (pair.next <= fp) {
+							break;
+						}
+						fp = pair.next;
+					}
+				}
+			}
+			break;
+		}
+	}
+	for (i = 0; i < count; i++) {
+		mach_port_deallocate(mach_task_self(), threads[i]);
+	}
+	vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(threads[0]));
+}
+
+static void *
+lock_sampler(void *unused)
+{
+	uintptr_t last_lock = 0;
+	unsigned long long last_said = 0;
+	unsigned said = 0;
+
+	(void)unused;
+	for (;;) {
+		arm_thread_state64_t state;
+		mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+		uintptr_t pc, x0;
+		const char *image;
+		uintptr_t offset = 0;
+
+		usleep(250000);
+		if (main_thread_port == THREAD_NULL) {
+			continue;
+		}
+		if (thread_get_state(main_thread_port, ARM_THREAD_STATE64, (thread_state_t)&state,
+		    &count) != KERN_SUCCESS) {
+			continue;
+		}
+		pc = (uintptr_t)arm_thread_state64_get_pc(state);
+		image = image_of(pc, &offset);
+		if (image == NULL || strstr(image, "libsystem_kernel") == NULL || offset < 0x1a00 ||
+		    offset > 0x1b00) {
+			continue;                       /* not waiting on an unfair lock */
+		}
+		x0 = (uintptr_t)state.__x[0];
+		if (x0 < 0x100000000ULL || (x0 & 3) != 0) {
+			continue;
+		}
+		{
+			uint32_t word = *(volatile uint32_t *)x0;
+
+			if (word == 0 || word == 1) {
+				continue;
+			}
+			if (x0 == last_lock && millis_now() - last_said < 5000) {
+				continue;
+			}
+			if (said > 40) {
+				continue;
+			}
+			said++;
+			last_lock = x0;
+			last_said = millis_now();
+			say_owner_of((uint64_t)(word >> 1), word, x0);
+		}
+	}
+	return NULL;
+}
+
+static void *
+lock_watchdog(void *unused)
+{
+	(void)unused;
+	for (;;) {
+		unsigned i;
+
+		sleep(1);
+		for (i = 0; i < LOCK_SLOTS; i++) {
+			pthread_t owner = NULL;
+			unsigned long long since = 0, now;
+			os_unfair_lock_t lock = NULL;
+
+			now = millis_now();
+			pthread_mutex_lock(&lock_slots_mutex);
+			if (lock_slots[i].lock != NULL && lock_slots[i].owner != NULL &&
+			    !lock_slots[i].reported && now > lock_slots[i].since &&
+			    now - lock_slots[i].since >= 3000) {
+				lock_slots[i].reported = 1;
+				owner = lock_slots[i].owner;
+				since = lock_slots[i].since;
+				lock = lock_slots[i].lock;
+			}
+			pthread_mutex_unlock(&lock_slots_mutex);
+			if (owner != NULL) {
+				say("hakios: lock %p held for %llu ms\n", lock, now - since);
+				say_thread_stack("holder", owner, 12);
+			}
+		}
+	}
+	return NULL;
+}
+
+/* A symbol of one named library: dlsym(RTLD_NEXT) can answer with our own hook (p187), and a
+   lock that calls itself is a deadlock, so the library is opened by name as a fallback. */
+static void *
+symbol_of(const char *library, const char *name, const void *ours)
+{
+	void *found = dlsym(RTLD_NEXT, name);
+
+	if (found != ours && found != NULL) {
+		return found;
+	}
+	{
+		void *handle = dlopen(library, RTLD_NOW | RTLD_NOLOAD);
+
+		if (handle != NULL) {
+			found = dlsym(handle, name);
+			if (found != ours) {
+				return found;
+			}
+		}
+	}
+	return NULL;
+}
+
+static void
+lock_watchdogs(void)
+{
+	pthread_t th;
+
+	orig_lock = (void (*)(os_unfair_lock_t))symbol_of("/usr/lib/system/libsystem_platform.dylib",
+	    "os_unfair_lock_lock", (const void *)hk_lock);
+	orig_unlock = (void (*)(os_unfair_lock_t))symbol_of("/usr/lib/system/libsystem_platform.dylib",
+	    "os_unfair_lock_unlock", (const void *)hk_unlock);
+	say("hakios: locks: lock %s, unlock %s\n", orig_lock != NULL ? "watched" : "NOT found",
+	    orig_unlock != NULL ? "watched" : "NOT found");
+	lock_sampler_start();
+	if (pthread_create(&th, NULL, lock_sampler, NULL) == 0) {
+		pthread_detach(th);
+	}
+	if (orig_lock == NULL || orig_unlock == NULL) {
+		return;
+	}
+	if (pthread_create(&th, NULL, lock_watchdog, NULL) == 0) {
+		pthread_detach(th);
+	}
+}
+
+/*
+ * sb_nostore2=1: the request SpringBoard makes for LaunchServices' server store, sent to an
+ * anonymous endpoint of lsd, is answered here at once with "the connection is invalid" instead
+ * of being sent -- that wait never ends on this port (see collab.md), and holding it is what
+ * keeps the first controller from being made.  The point is to see whether the rest comes up
+ * without the store.
+ */
+static int nostore2;
+static xpc_object_t_sb nostore2_error;
+
+/*
+ * The Do Not Disturb query that never comes back.  p220/p221: the main thread waits in a
+ * synchronous XPC from BoardServices+0x3128 to an endpoint with no name and pid 0, and the message
+ * asks "queryStateWithRequestDetails:completionHandler:" (DoNotDisturb.framework, called from
+ * UserNotificationsUIKit during the lock screen's setup).  The endpoint's process does not answer
+ * -- the same shape as the LaunchServices store in p210 -- so boot-arg sb_nodnd=1 cancels that
+ * connection before the send, and DND is taken for off (it is off: nothing else answered either).
+ */
+static int nodnd;
+static unsigned nodnd_cancelled;
+
+static int
+is_dnd_request(xpc_object_t_sb message)
+{
+	char *text;
+	int found;
+
+	if (message == NULL) {
+		return 0;
+	}
+	text = xpc_copy_description(message);
+	found = text != NULL && strstr(text, "queryStateWithRequestDetails") != NULL;
+	free(text);
+	return found;
+}
+
+/*
+ * Boot-arg sb_noanon=1: an endpoint with no name and no process (a listener endpoint handed over
+ * by somebody that is gone) is answered at once with a nil reply instead of being waited for.  p225
+ * shows why: with the Do Not Disturb query answered, the same BoardServices sync call keeps coming
+ * back on other such endpoints -- ten of the eight-second timeouts in one run, requests numbered
+ * past 1500 -- and the main thread never gets past them.
+ */
+static int noanon;
+static unsigned noanon_count;
+
+static void
+noanon_setup(void)
+{
+	char arguments[2048] = "";
+	size_t size = sizeof(arguments) - 1;
+
+	arguments[0] = 0;
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+	    strstr(arguments, "sb_noanon=1") != NULL) {
+		noanon = 1;
+		say("hakios: xpc: requests to anonymous endpoints are answered at once\n");
+	}
+}
+
+static void
+nodnd_setup(void)
+{
+	char arguments[2048] = "";
+	size_t size = sizeof(arguments) - 1;
+
+	arguments[0] = 0;
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+	    strstr(arguments, "sb_nodnd=1") != NULL) {
+		nodnd = 1;
+		say("hakios: dnd: the Do Not Disturb state query is cancelled, not waited for\n");
+	}
+}
+
+static void xpc_connection_cancel(xpc_connection_t_sb connection);
+
+/*
+ * Boot-arg sb_xpc_timeout=N: a synchronous XPC call that has not come back in N seconds has its
+ * connection cancelled, so the caller gets "connection invalid" and goes on.
+ *
+ * p222/p223 made the shape of the remaining walls clear: each one is such a call.  First the Do
+ * Not Disturb query on a dead anonymous endpoint (answered at once now, sb_nodnd), then cfprefsd --
+ * which answers every other process in tens of milliseconds while SpringBoard's own request is
+ * never answered.  This is a blunt instrument for finding out what is behind each of them, not
+ * something for a working boot.
+ *
+ * The waits are kept in a small table and one thread walks it: a job allocated per call and freed
+ * by the timer was written to by the caller after the timer had freed it, and that heap corruption
+ * is what killed SpringBoard with SIGABRT in p224 (the frames were libmalloc under libxpc).
+ */
+#define SB_WAIT_SLOTS 16
+
+struct sb_wait {
+	xpc_connection_t_sb connection;
+	unsigned number;
+	unsigned long long began;
+};
+
+static struct sb_wait sb_waits[SB_WAIT_SLOTS];
+static pthread_mutex_t sb_waits_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned sb_xpc_timeout;
+
+static int
+sb_wait_begin(xpc_connection_t_sb connection, unsigned number)
+{
+	int slot = -1;
+	int i;
+
+	pthread_mutex_lock(&sb_waits_lock);
+	for (i = 0; i < SB_WAIT_SLOTS; i++) {
+		if (sb_waits[i].connection == NULL) {
+			sb_waits[i].connection = connection;
+			sb_waits[i].number = number;
+			sb_waits[i].began = millis_now();
+			slot = i;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&sb_waits_lock);
+	return slot;
+}
+
+static void
+sb_wait_end(int slot)
+{
+	if (slot < 0 || slot >= SB_WAIT_SLOTS) {
+		return;
+	}
+	pthread_mutex_lock(&sb_waits_lock);
+	sb_waits[slot].connection = NULL;
+	pthread_mutex_unlock(&sb_waits_lock);
+}
+
+static void *
+sb_wait_watch(void *unused)
+{
+	(void)unused;
+	for (;;) {
+		int i;
+
+		usleep(250 * 1000);
+		pthread_mutex_lock(&sb_waits_lock);
+		for (i = 0; i < SB_WAIT_SLOTS; i++) {
+			if (sb_waits[i].connection != NULL &&
+			    millis_now() - sb_waits[i].began >= (unsigned long long)sb_xpc_timeout * 1000) {
+				say("hakios: xpc %u: %u s and no answer: the connection is cancelled\n",
+				    sb_waits[i].number, sb_xpc_timeout);
+				xpc_connection_cancel(sb_waits[i].connection);
+				sb_waits[i].connection = NULL;
+			}
+		}
+		pthread_mutex_unlock(&sb_waits_lock);
+	}
+	return NULL;
+}
+
+static void
+sb_xpc_timeout_setup(void)
+{
+	char arguments[2048] = "";
+	size_t size = sizeof(arguments) - 1;
+	const char *at;
+	pthread_t watcher;
+
+	arguments[0] = 0;
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+		return;
+	}
+	at = strstr(arguments, "sb_xpc_timeout=");
+	if (at == NULL) {
+		return;
+	}
+	sb_xpc_timeout = (unsigned)strtoul(at + 15, NULL, 10);
+	if (sb_xpc_timeout != 0 && sb_xpc_timeout < 5) {
+		sb_xpc_timeout = 5;
+	}
+	if (sb_xpc_timeout == 0) {
+		return;
+	}
+	say("hakios: xpc: a call with no answer is cancelled after %u s\n", sb_xpc_timeout);
+	if (pthread_create(&watcher, NULL, sb_wait_watch, NULL) == 0) {
+		pthread_detach(watcher);
+	}
+}
+
+/*
+ * Boot-arg sb_store_wait=N: when SpringBoard asks for the server store, it is first waited for N
+ * seconds -- once -- and then asked as usual.  p230 (the request not cancelled) sat on the apple for
+ * the whole run: lsd is given its container by lsd_delay, and by the time SpringBoard asks, the store
+ * may still be being made.  Asking later is the one difference that has not been tried.
+ */
+static unsigned store_wait;
+static int store_waited;
+
+static void
+store_wait_setup(void)
+{
+	char arguments[2048] = "";
+	size_t size = sizeof(arguments) - 1;
+	const char *at;
+
+	arguments[0] = 0;
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+		return;
+	}
+	at = strstr(arguments, "sb_store_wait=");
+	if (at == NULL) {
+		return;
+	}
+	store_wait = (unsigned)strtoul(at + 14, NULL, 10);
+	if (store_wait == 0 || store_wait > 120) {
+		store_wait = 0;
+		return;
+	}
+	say("hakios: store: the first request waits %u s before it is sent\n", store_wait);
+}
+
+static int
+is_store_request(xpc_object_t_sb message)
+{
+	static const char needle[] = "ServerStore";
+	xpc_object_t_sb root;
+	const char *bytes;
+	size_t length, i;
+	char *what;
+	int found = 0;
+
+	if (message == NULL) {
+		return 0;
+	}
+	root = xpc_dictionary_get_value(message, "root");
+	if (root != NULL) {
+		bytes = xpc_data_get_bytes_ptr(root);
+		length = xpc_data_get_length(root);
+		/* (the archive has NULs in it: walk the bytes, not strstr) */
+		for (i = 0; bytes != NULL && i + sizeof(needle) - 1 <= length; i++) {
+			if (memcmp(bytes + i, needle, sizeof(needle) - 1) == 0) {
+				found = 1;
+				break;
+			}
+		}
+	}
+	if (found) {
+		return 1;
+	}
+	what = xpc_copy_description(message);
+	found = what != NULL && strstr(what, "ServerStore") != NULL;
+	free(what);
+	return found;
+}
+
+static void
+xpc_connection_cancel(xpc_connection_t_sb connection);
+
+static xpc_object_t_sb
+nostore2_error_object(void)
+{
+	static const char *const names[] = {
+		"XPC_ERROR_CONNECTION_INVALID", "_XPC_ERROR_CONNECTION_INVALID",
+		"xpc_error_connection_invalid", "_xpc_error_connection_invalid",
+	};
+	unsigned i;
+
+	if (nostore2_error != NULL) {
+		return nostore2_error;
+	}
+	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		nostore2_error = (xpc_object_t_sb)dlsym(RTLD_DEFAULT, names[i]);
+		if (nostore2_error != NULL) {
+			say("hakios: store: the error object is %s\n", names[i]);
+			return nostore2_error;
+		}
+	}
+	return NULL;
+}
+
+static xpc_object_t_sb
+watched_sync(xpc_connection_t_sb connection, xpc_object_t_sb message)
+{
+	char peer[96];
+	unsigned number;
+	unsigned long long started;
+	xpc_object_t_sb reply;
+	int loud;
+
+	if (noanon && xpc_connection_get_name(connection) == NULL &&
+	    xpc_connection_get_pid(connection) <= 0) {
+		char *body = xpc_copy_description(message);
+		const char *at = body != NULL ? strstr(body, "bsxpc_SEL") : NULL;
+
+		if (__sync_add_and_fetch(&noanon_count, 1) <= 100) {
+			say("hakios: xpc: anonymous, answered at once: %s\n",
+			    at != NULL ? at : "(no selector)");
+		}
+		free(body);
+		xpc_connection_cancel(connection);
+		return NULL;
+	}
+	if (nodnd && xpc_connection_get_name(connection) == NULL &&
+	    xpc_connection_get_pid(connection) <= 0 && is_dnd_request(message)) {
+		/*
+		 * Nothing is sent: cancelling alone was not enough in p222 (requests 430 and 432
+		 * were cancelled and the next one, 433, was sent on the same endpoint and waited
+		 * for ever), so the caller gets a nil reply at once, which is what a dead
+		 * connection gives it anyway.
+		 */
+		if (__sync_add_and_fetch(&nodnd_cancelled, 1) <= 20) {
+			say("hakios: dnd: the Do Not Disturb query is answered at once (%u so far)\n",
+			    nodnd_cancelled);
+		}
+		xpc_connection_cancel(connection);
+		return NULL;
+	}
+	if (!nostore2 && store_wait != 0 && !store_waited && is_store_request(message)) {
+		store_waited = 1;
+		say("hakios: store: waiting %u s before the first request is sent\n", store_wait);
+		sleep(store_wait);
+	}
+	if (nostore2 && xpc_connection_get_name(connection) == NULL && is_store_request(message)) {
+		xpc_object_t_sb error = nostore2_error_object();
+
+		if (error != NULL) {
+			say("hakios: store: the server store request answered at once\n");
+			return error;
+		}
+		/*
+		 * No error object to hand back: the connection is cancelled instead, so libxpc
+		 * answers the send with its own "connection invalid" right away.
+		 */
+		say("hakios: store: the server store request: the connection is cancelled\n");
+		xpc_connection_cancel(connection);
+	}
+	if (!xpc_watched) {
+		return xpc_connection_send_message_with_reply_sync(connection, message);
+	}
+	peer_of(connection, peer, sizeof(peer));
+	number = __sync_add_and_fetch(&xpc_count, 1);
+	loud = number <= xpc_loud_limit;
+	/*
+	 * The name of the peer, one line, for every request: p214..p219 the main thread waits
+	 * in a synchronous XPC from BoardServices, and after the first 250 requests the peer was
+	 * not said at all -- the one being waited on was always further down.
+	 */
+	if (!loud && number <= 1500) {
+		uintptr_t at = 0;
+		const char *who = image_of((uintptr_t)__builtin_return_address(0), &at);
+
+		say("hakios: xpc %u: -> %s from %s+%#lx\n", number, peer,
+		    who != NULL ? who : "?", (unsigned long)at);
+	}
+	/*
+	 * An anonymous connection -- a listener endpoint given to us by another process, no name,
+	 * no pid -- never answers: p220, requests 430 and 431 from BoardServices+0x3128, and the
+	 * main thread waits there while the lock screen never shows.  What is being asked for is
+	 * in the message: said here for the first twelve of them.
+	 */
+	if (number <= 1500 && xpc_connection_get_name(connection) == NULL &&
+	    xpc_connection_get_pid(connection) <= 0) {
+		static unsigned anonymous;
+
+		if (__sync_add_and_fetch(&anonymous, 1) <= 12) {
+			char *body = xpc_copy_description(message);
+
+			say("hakios: xpc %u: anonymous, message %s\n", number,
+			    body != NULL ? body : "(nothing)");
+			free(body);
+			say_frames("call", (uintptr_t)__builtin_frame_address(0), 10);
+		}
+	}
+	if (loud) {
+		uintptr_t offset = 0;
+		const char *image = image_of((uintptr_t)__builtin_return_address(0), &offset);
+		char *what = xpc_copy_description(connection);
+		char *body = xpc_copy_description(message);
+
+		say("hakios: xpc %u: -> %s (%p) from %s+%#lx\n     object %s\n     message %s\n",
+		    number, peer, connection, image != NULL ? image : "?", (unsigned long)offset,
+		    what != NULL ? what : "(nothing)", body != NULL ? body : "(nothing)");
+		say_frames("call", (uintptr_t)__builtin_frame_address(0), 12);
+		say_graph("request", message);
+		free(what);
+		free(body);
+	}
+	started = millis_now();
+	{
+		int slot = -1;
+
+		if (sb_xpc_timeout != 0) {
+			slot = sb_wait_begin(connection, number);
+		}
+		reply = xpc_connection_send_message_with_reply_sync(connection, message);
+		sb_wait_end(slot);
+	}
+	if (loud || millis_now() - started > 900) {
+		say("hakios: xpc %u: <- %s in %llu ms%s\n", number, peer, millis_now() - started,
+		    reply == NULL ? " (nothing)" : "");
+		if (millis_now() - started > 500 && reply != NULL) {
+			char *said = xpc_copy_description(reply);
+
+			say("hakios: xpc %u:   reply %s\n", number, said != NULL ? said : "(nothing)");
+			free(said);
+			say_graph("answer", reply);
+		}
+	}
+	return reply;
+}
+
+static void
+watched_async(xpc_connection_t_sb connection, xpc_object_t_sb message, dispatch_queue_t queue,
+    xpc_handler_t_sb handler)
+{
+	char peer[96];
+	unsigned number;
+	unsigned long long started;
+	int loud;
+
+	if (!xpc_watched) {
+		xpc_connection_send_message_with_reply(connection, message, queue, handler);
+		return;
+	}
+	char *peer_copy;
+
+	peer_of(connection, peer, sizeof(peer));
+	peer_copy = strdup(peer);
+	number = __sync_add_and_fetch(&xpc_count, 1);
+	loud = number <= xpc_loud_limit;
+	if (loud) {
+		say("hakios: xpc %u: -> %s (async, connection %p)\n", number, peer_copy, connection);
+	}
+	started = millis_now();
+	xpc_connection_send_message_with_reply(connection, message, queue, ^(xpc_object_t_sb reply) {
+		if (loud || millis_now() - started > 900) {
+			say("hakios: xpc %u: <- %s (async) in %llu ms%s\n", number,
+			    peer_copy != NULL ? peer_copy : "(no name)", millis_now() - started,
+			    reply == NULL ? " (nothing)" : "");
+		}
+		if (handler != NULL) {
+			handler(reply);
+		}
+	});
+}
+
+static xpc_connection_t_sb
+watched_create_mach_service(const char *name, dispatch_queue_t queue, uint64_t flags)
+{
+	xpc_connection_t_sb connection = xpc_connection_create_mach_service(name, queue, flags);
+
+	say("hakios: xpc: connect to %s -> %p\n", name != NULL ? name : "(no name)", connection);
+	return connection;
+}
+
+static xpc_connection_t_sb
+watched_create(const char *name, dispatch_queue_t queue)
+{
+	xpc_connection_t_sb connection = xpc_connection_create(name, queue);
+
+	say("hakios: xpc: create %s -> %p\n", name != NULL ? name : "(no name)", connection);
+	return connection;
+}
+
+static void
+watched_send_message(xpc_connection_t_sb connection, xpc_object_t_sb message)
+{
+	const char *name = xpc_connection_get_name(connection);
+
+	if (xpc_watched && __sync_add_and_fetch(&xpc_count, 1) <= xpc_loud_limit) {
+		say("hakios: xpc: send to %s (no reply wanted)\n", name != NULL ? name : "(no name)");
+	}
+	xpc_connection_send_message(connection, message);
+}
+
+#define HAKIOS_INTERPOSE(ours, theirs)                                                \
+	__attribute__((used)) static struct {                                          \
+		const void *replacement, *replacee;                                     \
+	} interpose_##theirs __attribute__((section("__DATA,__interpose"))) = {       \
+		(const void *)(ours), (const void *)(theirs)                            \
+	}
+
+HAKIOS_INTERPOSE(watched_sync, xpc_connection_send_message_with_reply_sync);
+HAKIOS_INTERPOSE(watched_async, xpc_connection_send_message_with_reply);
+HAKIOS_INTERPOSE(watched_create_mach_service, xpc_connection_create_mach_service);
+HAKIOS_INTERPOSE(watched_create, xpc_connection_create);
+HAKIOS_INTERPOSE(watched_send_message, xpc_connection_send_message);
+
+static xpc_connection_t_sb
+watched_from_endpoint(xpc_object_t_sb endpoint)
+{
+	xpc_connection_t_sb connection = xpc_connection_create_from_endpoint(endpoint);
+	char *what = xpc_copy_description(endpoint);
+
+	say("hakios: xpc: from endpoint %s -> %p\n", what != NULL ? what : "(nothing)", connection);
+	free(what);
+	return connection;
+}
+
+HAKIOS_INTERPOSE(watched_from_endpoint, xpc_connection_create_from_endpoint);
+
+
+/* ---- a wait that never ends, made to end ------------------------------------------------------ */
+
+/*
+ * SpringBoard's main thread, on this port, waits in a raw mach message inside BackBoardServices
+ * (the frame chain of p188/p192/p200: BKS+0x9ad4 ... FrontBoard+0x37a4c) and nothing ever answers
+ * it.  boot-arg bks_timeout=N (milliseconds, 0 or absent -- off) makes every wait of that kind
+ * time out after N ms instead: the caller then gets MACH_RCV_TIMED_OUT, which is what a dead
+ * service would give it, and SpringBoard either retries or goes on.  The point is to see which.
+ */
+static mach_msg_return_t (*orig_sb_mach_msg)(mach_msg_header_t *, mach_msg_option_t,
+    mach_msg_size_t, mach_msg_size_t, mach_port_t, mach_msg_timeout_t, mach_port_t);
+static mach_msg_return_t hk_sb_mach_msg(mach_msg_header_t *, mach_msg_option_t, mach_msg_size_t,
+    mach_msg_size_t, mach_port_t, mach_msg_timeout_t, mach_port_t);
+static unsigned bks_timeout;
+static unsigned bks_timeouts;
+static unsigned bks_seen;
+
+static void
+bks_timeout_setup(void)
+{
+	char arguments[2048];
+	size_t size = sizeof(arguments) - 1;
+	const char *at;
+
+	arguments[0] = 0;
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+		return;
+	}
+	at = strstr(arguments, "bks_timeout=");
+	if (at != NULL) {
+		bks_timeout = (unsigned)strtoul(at + 12, NULL, 10);
+	}
+	if (bks_timeout == 0) {
+		return;
+	}
+	orig_sb_mach_msg = (mach_msg_return_t (*)(mach_msg_header_t *, mach_msg_option_t,
+	    mach_msg_size_t, mach_msg_size_t, mach_port_t, mach_msg_timeout_t, mach_port_t))
+	    dlsym(RTLD_NEXT, "mach_msg");
+	if ((const void *)orig_sb_mach_msg == (const void *)hk_sb_mach_msg) {
+		/*
+		 * dlsym(RTLD_NEXT) answers with our own hook here (the same as with unlink in
+		 * inject.c).  Unlike there, a direct call is safe: that is how the xpc hooks in this
+		 * very file reach the real functions, and it has never recursed.
+		 */
+		say("hakios: bks: mach_msg comes by its own name\n");
+		orig_sb_mach_msg = NULL;
+	}
+	say("hakios: bks: waits from BackBoardServices time out after %u ms\n", bks_timeout);
+}
+
+static mach_msg_return_t
+hk_sb_mach_msg(mach_msg_header_t *msg, mach_msg_option_t options, mach_msg_size_t size,
+    mach_msg_size_t rcv_size, mach_port_t rcv_name, mach_msg_timeout_t timeout,
+    mach_port_t notify)
+{
+	uintptr_t offset = 0;
+	const char *image = image_of((uintptr_t)__builtin_return_address(0), &offset);
+
+	if (image != NULL && strstr(image, "BackBoardServices") != NULL &&
+	    __sync_add_and_fetch(&bks_seen, 1) <= 30) {
+		say("hakios: bks: mach_msg from %s+%#lx: send %d, recv %d, id %u, size %u\n",
+		    image, (unsigned long)offset, (options & MACH_SEND_MSG) ? 1 : 0,
+		    (options & MACH_RCV_MSG) ? 1 : 0, msg != NULL ? msg->msgh_id : 0,
+		    msg != NULL ? msg->msgh_size : 0);
+	}
+	if (bks_timeout != 0 && (options & MACH_RCV_MSG) != 0 && image != NULL &&
+	    strstr(image, "BackBoardServices") != NULL) {
+		mach_msg_return_t result;
+
+		if (orig_sb_mach_msg != NULL) {
+			result = orig_sb_mach_msg(msg, options | MACH_RCV_TIMEOUT, size, rcv_size,
+			    rcv_name, bks_timeout, notify);
+		} else {
+			result = mach_msg(msg, options | MACH_RCV_TIMEOUT, size, rcv_size, rcv_name,
+			    bks_timeout, notify);
+		}
+
+		if (result == MACH_RCV_TIMED_OUT && __sync_add_and_fetch(&bks_timeouts, 1) <= 40) {
+			say("hakios: bks: a wait from %s+%#lx timed out after %u ms (id %u, from %s)\n",
+			    image, (unsigned long)offset, bks_timeout, msg != NULL ? msg->msgh_id : 0);
+		}
+		return result;
+	}
+	if (orig_sb_mach_msg != NULL) {
+		return orig_sb_mach_msg(msg, options, size, rcv_size, rcv_name, timeout, notify);
+	}
+	return mach_msg(msg, options, size, rcv_size, rcv_name, timeout, notify);
+}
+
+static mach_msg_return_t
+hk_sb_mach_msg_overwrite(mach_msg_header_t *msg, mach_msg_option_t options, mach_msg_size_t size,
+    mach_msg_size_t rcv_size, mach_port_t rcv_name, mach_msg_timeout_t timeout, mach_port_t notify,
+    mach_msg_header_t *rcv_msg, mach_msg_size_t rcv_msg_size)
+{
+	(void)rcv_msg;
+	(void)rcv_msg_size;
+	return hk_sb_mach_msg(msg, options, size, rcv_size, rcv_name, timeout, notify);
+}
+
+#define DYLD_INTERPOSE_SB(ours, theirs)                                                 \
+	__attribute__((used)) static struct {                                             \
+		const void *replacement, *replacee;                                        \
+	} sb_interpose_##theirs __attribute__((section("__DATA,__interpose"))) = {       \
+		(const void *)(ours), (const void *)(theirs)                               \
+	}
+
+DYLD_INTERPOSE_SB(hk_sb_mach_msg, mach_msg);
+DYLD_INTERPOSE_SB(hk_sb_mach_msg_overwrite, mach_msg_overwrite);
+
+/*
+ * ---- the service SpringBoard waits for -------------------------------------------------------
+ *
+ * p210/p212: the main thread sits in a raw mach message inside BackBoardServices, and the names
+ * of the dyld cache put that frame in __BKSDisplayGetMainScreenInfo -- the MIG call to the display
+ * server, com.apple.backboard.display.services (backboardd), made with no timeout at all.  Nothing
+ * here can name the port from that frame, so the look-ups are logged instead: SpringBoard asks the
+ * bootstrap server the old way (bootstrap_look_up, from BackBoardServices), not through libxpc,
+ * where the hooks above already are.  Boot-arg bs_loud=0 turns the lines off; the first 300 only.
+ */
+extern kern_return_t bootstrap_look_up(mach_port_t bootstrap_port, const char *service_name,
+    mach_port_t *service_port);
+extern kern_return_t bootstrap_look_up2(mach_port_t bootstrap_port, const char *service_name,
+    mach_port_t *service_port, pid_t target_pid, uint64_t flags);
+
+static unsigned bs_lines;
+static int bs_silent;
+
+static void
+bs_say(const char *which, const char *service_name, pid_t target_pid, uint64_t flags,
+    kern_return_t result, mach_port_t port, unsigned long long began, const char *image,
+    uintptr_t offset)
+{
+	unsigned long long took = millis_now() - began;
+
+	if (bs_silent || __sync_add_and_fetch(&bs_lines, 1) > 300) {
+		return;
+	}
+	if (image != NULL) {
+		say("hakios: bs: %llu ms %s \"%s\" pid %d flags %#llx -> %d port %u in %llu ms, "
+		    "from %s+%#lx\n", began, which,
+		    service_name != NULL ? service_name : "(no name)", (int)target_pid,
+		    (unsigned long long)flags, (int)result, (unsigned)port, took, image,
+		    (unsigned long)offset);
+	} else {
+		say("hakios: bs: %llu ms %s \"%s\" pid %d flags %#llx -> %d port %u in %llu ms\n",
+		    began, which, service_name != NULL ? service_name : "(no name)", (int)target_pid,
+		    (unsigned long long)flags, (int)result, (unsigned)port, took);
+	}
+}
+
+static void
+bs_setup(void)
+{
+	char arguments[2048];
+	size_t size = sizeof(arguments) - 1;
+
+	arguments[0] = 0;
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+	    strstr(arguments, "bs_loud=0") != NULL) {
+		bs_silent = 1;
+	}
+	say("hakios: bs: bootstrap look-ups are logged\n");
+}
+
+static kern_return_t
+hk_sb_bootstrap_look_up(mach_port_t bootstrap_port, const char *service_name,
+    mach_port_t *service_port)
+{
+	unsigned long long began = millis_now();
+	uintptr_t offset = 0;
+	const char *image = image_of((uintptr_t)__builtin_return_address(0), &offset);
+	kern_return_t result;
+
+	result = bootstrap_look_up(bootstrap_port, service_name, service_port);
+	bs_say("look_up", service_name, 0, 0, result,
+	    result == 0 && service_port != NULL ? *service_port : 0, began, image, offset);
+	return result;
+}
+
+static kern_return_t
+hk_sb_bootstrap_look_up2(mach_port_t bootstrap_port, const char *service_name,
+    mach_port_t *service_port, pid_t target_pid, uint64_t flags)
+{
+	unsigned long long began = millis_now();
+	uintptr_t offset = 0;
+	const char *image = image_of((uintptr_t)__builtin_return_address(0), &offset);
+	kern_return_t result;
+
+	result = bootstrap_look_up2(bootstrap_port, service_name, service_port, target_pid, flags);
+	bs_say("look_up2", service_name, target_pid, flags, result,
+	    result == 0 && service_port != NULL ? *service_port : 0, began, image, offset);
+	return result;
+}
+
+DYLD_INTERPOSE_SB(hk_sb_bootstrap_look_up, bootstrap_look_up);
+DYLD_INTERPOSE_SB(hk_sb_bootstrap_look_up2, bootstrap_look_up2);
+
+/*
+ * ---- how long the display server takes --------------------------------------------------------
+ *
+ * BKSDisplayServicesStart asks the display server for the main screen's size and scale before
+ * anything else of SpringBoard's is made, and the frame of p210/p212 is that call's mach message.
+ * The call itself is timed here: it returns in milliseconds on a healthy system, and this says
+ * whether the wait that holds the main thread is this one or something later.
+ */
+extern int BKSDisplayServicesGetMainScreenInfo(void *width, void *height, void *scale,
+    void *rotation);
+
+static unsigned display_lines;
+
+static int
+shown_display_info(void *width, void *height, void *scale, void *rotation)
+{
+	unsigned long long began = millis_now();
+	int result = BKSDisplayServicesGetMainScreenInfo(width, height, scale, rotation);
+
+	if (__sync_add_and_fetch(&display_lines, 1) <= 40) {
+		say("hakios: display: main screen info %d in %llu ms\n", result, millis_now() - began);
+	}
+	return result;
+}
+
+DYLD_INTERPOSE_SB(shown_display_info, BKSDisplayServicesGetMainScreenInfo);
+
+/* ---- the names behind the offsets ------------------------------------------------------------ */
+
+static void
+say_symbols(void)
+{
+	static const char *names[] = {
+		"mach_msg_trap", "mach_msg2_trap", "mach_msg_overwrite_trap",
+		"__psynch_cvwait", "__psynch_mutexwait", "__psynch_mutexdrop", "__psynch_cvbroad",
+		"__ulock_wait", "__ulock_wait2", "__semwait_signal", "__workq_kernreturn",
+		"__thread_switch", "swtch_pri", "read", "write", "pread", "open", "stat",
+		"getdirentries", "__getdirentries64", "fcntl", "fsync", "kill",
+		"getattrlist", "setattrlist", "getattrlistbulk", "access", "chdir", "getcwd",
+		"__open_dprotected_np", "openat", "mkdir", "rmdir", "unlink", "rename", "chmod",
+		"getxattr", "setxattr", "listxattr", "statfs", "getfsstat", "mmap", "__mmap",
+		"munmap", "mprotect", "msync", "__msync", "dup", "pipe", "posix_spawn", "umask",
+		"os_unfair_lock_lock", "os_unfair_lock_unlock", "os_unfair_lock_trylock",
+		"os_unfair_recursive_lock_lock_with_options", "os_unfair_recursive_lock_unlock",
+		"pthread_cond_wait", "pthread_mutex_lock", "_pthread_wqthread",
+		"dispatch_semaphore_wait", "dispatch_sync", "dispatch_async", "dispatch_group_wait",
+		"dispatch_sync_f", "dispatch_once_f", "semaphore_wait_trap",
+	};
+	unsigned i;
+
+	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		void *address = dlsym(RTLD_DEFAULT, names[i]);
+		uintptr_t offset = 0;
+		const char *image;
+
+		if (address == NULL) {
+			continue;
+		}
+		image = image_of((uintptr_t)address, &offset);
+		if (image != NULL) {
+			say("hakios: sym %s = %s+%#lx\n", names[i], image, (unsigned long)offset);
+		}
+	}
+}
+
+
+/* ---- which connections SpringBoard makes ----------------------------------------------------- */
+
+static IMP
+hook_method(const char *class_name, const char *selector, IMP replacement)
+{
+	Class cls = objc_getClass(class_name);
+	Method method = cls != NULL ? class_getInstanceMethod(cls, sel_registerName(selector)) : NULL;
+
+	if (method == NULL) {
+		say("hakios: xpc: -[%s %s] is not there\n", class_name, selector);
+		return NULL;
+	}
+	IMP original = method_getImplementation(method);
+
+	method_setImplementation(method, replacement);
+	return original;
+}
+
+static id (*orig_init_service)(id, SEL, id);
+static id (*orig_init_mach_service)(id, SEL, id, unsigned long);
+static id (*orig_init_listener_endpoint)(id, SEL, id);
+static id (*orig_init_endpoint)(id, SEL, id);
+
+static id
+log_init_service(id self, SEL sel, id name)
+{
+	id result = orig_init_service(self, sel, name);
+
+	say("hakios: xpc: NSXPCConnection service %s -> %p\n", text_of(name), self);
+	return result;
+}
+
+static id
+log_init_mach_service(id self, SEL sel, id name, unsigned long options)
+{
+	id result = orig_init_mach_service(self, sel, name, options);
+
+	say("hakios: xpc: NSXPCConnection mach service %s (options %#lx) -> %p\n", text_of(name), options,
+	    self);
+	return result;
+}
+
+static void
+say_endpoint(id endpoint)
+{
+	id xpc = NULL;
+
+	if (endpoint != NULL && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(endpoint,
+	    sel_registerName("respondsToSelector:"), sel_registerName("_endpoint"))) {
+		xpc = ((id (*)(id, SEL))objc_msgSend)(endpoint, sel_registerName("_endpoint"));
+	}
+	if (xpc != NULL) {
+		char *what = xpc_copy_description(xpc);
+
+		say("hakios: xpc:   endpoint %s (%p)\n", what != NULL ? what : "(nothing)", xpc);
+		free(what);
+	} else {
+		say("hakios: xpc:   endpoint %p (no _endpoint)\n", endpoint);
+	}
+}
+
+static id
+log_init_listener_endpoint(id self, SEL sel, id endpoint)
+{
+	say("hakios: xpc: NSXPCConnection listener endpoint -> %p\n", self);
+	say_endpoint(endpoint);
+	return orig_init_listener_endpoint(self, sel, endpoint);
+}
+
+static id
+log_init_endpoint(id self, SEL sel, id endpoint)
+{
+	say("hakios: xpc: NSXPCConnection endpoint -> %p\n", self);
+	say_endpoint(endpoint);
+	return orig_init_endpoint(self, sel, endpoint);
+}
+
+static void
+watch_nsxpc(void)
+{
+	orig_init_service = (void *)hook_method("NSXPCConnection", "initWithServiceName:",
+	    (IMP)log_init_service);
+	orig_init_mach_service = (void *)hook_method("NSXPCConnection", "initWithMachServiceName:options:",
+	    (IMP)log_init_mach_service);
+	orig_init_listener_endpoint = (void *)hook_method("NSXPCConnection", "initWithListenerEndpoint:",
+	    (IMP)log_init_listener_endpoint);
+	orig_init_endpoint = (void *)hook_method("NSXPCConnection", "initWithEndpoint:",
+	    (IMP)log_init_endpoint);
+	say("hakios: xpc: NSXPCConnection initialisers hooked\n");
+}
+
+
+/* ---- where FSNode comes from, and what the endpoint arrived in ------------------------------- */
+
+static void
+say_class_family(const char *name)
+{
+	Class cls = objc_getClass(name);
+	const char *image;
+
+	if (cls == NULL) {
+		say("hakios: class %s is not there\n", name);
+		return;
+	}
+	image = class_getImageName(cls);
+	say("hakios: class %s comes from %s\n", name, image != NULL ? image : "?");
+	if (strcmp(name, "FSNode") == 0) {
+		unsigned count = 0, i;
+		Method *methods = class_copyMethodList(cls, &count);
+
+		say("hakios: class FSNode has %u methods\n", count);
+		for (i = 0; i < count && i < 120; i++) {
+			const char *selector = sel_getName(method_getName(methods[i]));
+			const char *encoding = method_getTypeEncoding(methods[i]);
+
+			say("hakios: FSNode -%s  %s\n", selector, encoding != NULL ? encoding : "");
+		}
+		free(methods);
+	}
+}
+
+
+/* ---- a start that waits ---------------------------------------------------------------------- */
+
+static void
+wait_if_asked(void)
+{
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+	const char *p;
+	long seconds;
+
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+		return;
+	}
+	if ((p = strstr(arguments, "sbwait=")) == NULL) {
+		return;
+	}
+	seconds = strtol(p + 7, NULL, 10);
+	if (seconds <= 0 || seconds > 300) {
+		return;
+	}
+	say("hakios: SpringBoard waits %ld s before main (sbwait)\n", seconds);
+	sleep((unsigned)seconds);
+	say("hakios: SpringBoard goes on\n");
+}
+
+
+/* ---- the invocation, byte for byte ----------------------------------------------------------- */
+
+static void
+say_graph(const char *what, xpc_object_t_sb message)
+{
+	xpc_object_t_sb data;
+	const unsigned char *bytes;
+	size_t length, i, used = 0;
+	char text[640];
+
+	if (message == NULL) {
+		return;
+	}
+	data = xpc_dictionary_get_value(message, "root");
+	if (data == NULL) {
+		return;
+	}
+	bytes = xpc_data_get_bytes_ptr(data);
+	length = xpc_data_get_length(data);
+	if (bytes == NULL || length == 0) {
+		return;
+	}
+	for (i = 0; i < length && i < 190 && used + 3 < sizeof(text); i++) {
+		used += (size_t)snprintf(text + used, sizeof(text) - used, "%02x", bytes[i]);
+	}
+	say("hakios: %s: %zu bytes %s\n", what, length, text);
+}
+
+
+/* ---- the driver's own account of the lock ---------------------------------------------------- */
+
+static void
+say_apfs_stats(const char *when)
+{
+	size_t size = 65536;
+	char *text = malloc(size);
+
+	if (text == NULL) {
+		return;
+	}
+	memset(text, 0, size);
+	if (sysctlbyname("kern.apfs_stats", text, &size, NULL, 0) != 0) {
+		say("hakios: apfs stats (%s): the sysctl refused (%d)\n", when, errno);
+		free(text);
+		return;
+	}
+	{
+		char *line = text;
+
+		say("hakios: apfs stats, %s\n", when);
+		while (line != NULL && *line != 0) {
+			char *end = strchr(line, '\n');
+
+			if (end != NULL) {
+				*end = 0;
+			}
+			say("apfs| %s\n", line);
+			if (end == NULL) {
+				break;
+			}
+			line = end + 1;
+		}
+		say("hakios: apfs stats end\n");
+	}
+	free(text);
+}
+
+static id (*orig_view_did_appear)(id, SEL, BOOL);
+static void log_view_did_appear(id self, SEL sel, BOOL animated)
+{
+	say("hakios: SB milestone: -[SBHomeScreenViewController viewDidAppear:]\n");
+	if (orig_view_did_appear != NULL) { orig_view_did_appear(self, sel, animated); }
+}
+
+/* ---- getServerStoreBlockingWithCompletionHandler: the call that never comes back ------------- */
+
+/*
+ * Boot-arg sb_nostore=1: the LaunchServices store is asked for with a blocking XPC call that this
+ * port never answers (see collab.md: "xpc 17/25 -> (no name)"), and SpringBoard waits in it
+ * forever.  Every class is looked through for that selector; if one has it, its implementation
+ * becomes one that answers the completion handler at once with "no store" -- the point is to see
+ * whether the rest of SpringBoard can come up without it.  sb_store_scan=1 only lists what is
+ * there.
+ */
+static int nostore_wanted;
+
+static void
+nostore_handler(id self, SEL _cmd, id handler)
+{
+	Class error_class = objc_getClass("NSError");
+	id error = nil;
+
+	if (error_class != NULL) {
+		error = ((id (*)(id, SEL, id, long, id))objc_msgSend)(error_class,
+		    sel_registerName("errorWithDomain:code:userInfo:"), nil, 1, nil);
+	}
+	say("hakios: store: %s getServerStoreBlocking... refused at once (no store)\n",
+	    class_getName(object_getClass(self)));
+	if (handler != NULL) {
+		((void (^)(id, id))handler)(nil, error);
+	}
+}
+
+static void
+store_methods_setup(void)
+{
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+	unsigned count, i, hooked = 0;
+	Class *classes;
+
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+		return;
+	}
+	if (strstr(arguments, "sb_nostore=1") == NULL && strstr(arguments, "sb_store_scan=1") == NULL) {
+		return;
+	}
+	nostore_wanted = strstr(arguments, "sb_nostore=1") != NULL;
+	count = objc_getClassList(NULL, 0);
+	classes = count != 0 ? calloc(count, sizeof(Class)) : NULL;
+	if (classes == NULL) {
+		return;
+	}
+	count = objc_getClassList(classes, count);
+	for (i = 0; i < count; i++) {
+		Class cls = classes[i];
+		unsigned pass;
+
+		for (pass = 0; pass < 2; pass++) {
+			Class owner = pass == 0 ? cls : object_getClass(cls);
+			unsigned method_count = 0, m;
+			Method *methods;
+
+			if (owner == NULL) {
+				continue;
+			}
+			methods = class_copyMethodList(owner, &method_count);
+			for (m = 0; m < method_count; m++) {
+				const char *name = sel_getName(method_getName(methods[m]));
+
+				if (strstr(name, "ServerStore") == NULL &&
+				    strstr(name, "serverStore") == NULL) {
+					continue;
+				}
+				say("hakios: store method: %c[%s %s] %s\n", pass == 0 ? '-' : '+',
+				    class_getName(cls), name, method_getTypeEncoding(methods[m]));
+				if (nostore_wanted && strcmp(name, "getServerStoreBlockingWithCompletionHandler:") == 0) {
+					method_setImplementation(methods[m], (IMP)nostore_handler);
+					hooked++;
+				}
+			}
+			free(methods);
+		}
+	}
+	free(classes);
+	say("hakios: store methods: %u, hooked %u\n", count, hooked);
+}
+
+static void
+nostore2_setup(void)
+{
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+	    strstr(arguments, "sb_nostore2=1") != NULL) {
+		nostore2 = 1;
+		say("hakios: store: the blocking server store request is answered at once\n");
+	}
+}
+
+
+/*
+ * NSURL with a nil path.  The window server reaches LaunchServices' store and then makes an URL
+ * of a path the container manager did not give it (nil): Foundation throws, and the process is
+ * gone -- the same repair the other daemons already have (inject.c), the window server did not.
+ */
+static id
+sb_fallback_path(void)
+{
+	static id fallback;
+
+	if (fallback == nil) {
+		fallback = (id)CFStringCreateWithCString(kCFAllocatorDefault, "/private/var/tmp",
+		    kCFStringEncodingUTF8);
+	}
+	return fallback;
+}
+
+static id (*orig_url_path)(id, SEL, id);
+static id (*orig_url_path_dir)(id, SEL, id, BOOL);
+static id (*orig_url_path_dir_rel)(id, SEL, id, BOOL, id);
+
+static id
+sb_url_path(id self, SEL selector, id path)
+{
+	if (path == nil) {
+		path = sb_fallback_path();
+		say("hakios: NSURL: a nil path became /private/var/tmp\n");
+	}
+	return orig_url_path(self, selector, path);
+}
+
+static id
+sb_url_path_dir(id self, SEL selector, id path, BOOL is_directory)
+{
+	if (path == nil) {
+		path = sb_fallback_path();
+		say("hakios: NSURL: a nil path became /private/var/tmp (isDirectory)\n");
+	}
+	return orig_url_path_dir(self, selector, path, is_directory);
+}
+
+static id
+sb_url_path_dir_rel(id self, SEL selector, id path, BOOL is_directory, id base)
+{
+	if (path == nil) {
+		path = sb_fallback_path();
+		say("hakios: NSURL: a nil path became /private/var/tmp (relative)\n");
+	}
+	return orig_url_path_dir_rel(self, selector, path, is_directory, base);
+}
+
+static void
+url_path_fixes(void)
+{
+	Class url = objc_getClass("NSURL");
+	Class meta;
+	Method method;
+
+	if (url == NULL) {
+		return;
+	}
+	meta = object_getClass(url);
+	if ((method = class_getInstanceMethod(url, sel_registerName("initFileURLWithPath:"))) != NULL) {
+		orig_url_path = (void *)method_getImplementation(method);
+		method_setImplementation(method, (IMP)sb_url_path);
+	}
+	if ((method = class_getInstanceMethod(url, sel_registerName("initFileURLWithPath:isDirectory:"))) != NULL) {
+		orig_url_path_dir = (void *)method_getImplementation(method);
+		method_setImplementation(method, (IMP)sb_url_path_dir);
+	}
+	if ((method = class_getInstanceMethod(url, sel_registerName("initFileURLWithPath:isDirectory:relativeTo:"))) != NULL) {
+		orig_url_path_dir_rel = (void *)method_getImplementation(method);
+		method_setImplementation(method, (IMP)sb_url_path_dir_rel);
+	}
+	/* (+fileURLWithPath: goes through these inits: they are the place to stand) */
+	say("hakios: NSURL: the nil path repairs are in\n");
+}
+
+/* ---- opening a URL by itself -------------------------------------------------------------- */
+
+/*
+ * Settings -> General -> iPhone Storage is the page that asks each application's usage plugin
+ * for its size, and the Podcasts one traps in this port; to try a cure without a finger on the
+ * screen, /redwood/etc/open.url holds lines "<seconds> <url>" and each is opened from here after
+ * that many seconds, from the main queue.  The log says what was asked for and what came back,
+ * and whether the plugin was loaded at all (inject_app.c says that).
+ */
+static void
+open_url(const char *text)
+{
+	Class workspace_class = objc_getClass("LSApplicationWorkspace");
+	SEL default_workspace = sel_registerName("defaultWorkspace");
+	SEL open_sensitive = sel_registerName("openSensitiveURL:withOptions:");
+	SEL open_plain = sel_registerName("openURL:withOptions:");
+	id (*send_id)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	id (*send_id_id)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+	id (*send_id_text)(id, SEL, const char *) = (id (*)(id, SEL, const char *))objc_msgSend;
+	BOOL (*send_bool)(id, SEL, id, id) = (BOOL (*)(id, SEL, id, id))objc_msgSend;
+	id workspace, address, string;
+	BOOL answer = NO;
+
+	if (workspace_class == NULL || class_getClassMethod(workspace_class, default_workspace) == NULL) {
+		say("hakios: open: there is no application workspace here\n");
+		return;
+	}
+	workspace = send_id((id)workspace_class, default_workspace);
+	/*
+	 * "bundle:<identifier>" is the application itself, which is what most of these are: a URL
+	 * scheme is not always the application's to answer (Photos answers photos-redirect: only
+	 * where Shortcuts is the caller).
+	 */
+	if (strncmp(text, "bundle:", 7) == 0) {
+		/*
+		 * The application by its bundle: SpringBoardServices is the way SpringBoard itself starts
+		 * one (SBSLaunchApplicationWithIdentifier is in the shared cache and exported), while
+		 * -[LSApplicationWorkspace openApplicationWithBundleIdentifier:] does not exist on this
+		 * system at all -- the name is openApplicationWithBundleID:, and p330 showed that asking
+		 * for the longer one launches nothing and says nothing.
+		 */
+		SEL open_bundle = sel_registerName("openApplicationWithBundleID:");
+		id identifier = send_id_text((id)objc_getClass("NSString"),
+		    sel_registerName("stringWithUTF8String:"), text + 7);
+		void *launch = dlsym(RTLD_DEFAULT, "SBSLaunchApplicationWithIdentifier");
+
+		if (identifier != NULL && launch != NULL) {
+			int status = ((int (*)(id, signed char))launch)(identifier, 0);
+
+			say("hakios: open: the application %s launched, status %d\n", text + 7, status);
+			return;
+		}
+		if (identifier != NULL && workspace != NULL &&
+		    class_getInstanceMethod(workspace_class, open_bundle) != NULL) {
+			answer = send_bool(workspace, open_bundle, identifier, NULL);
+			say("hakios: open: the application %s asked for, answer %d\n", text + 7, answer);
+			return;
+		}
+		say("hakios: open: no way to start %s here (no SBSLaunchApplicationWithIdentifier, no "
+		    "-openApplicationWithBundleID:)\n", text + 7);
+		return;
+	}
+	string = send_id_text((id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), text);
+	address = string != NULL ?
+	    send_id_id((id)objc_getClass("NSURL"), sel_registerName("URLWithString:"), string) : NULL;
+	if (address != NULL && workspace != NULL &&
+	    class_getInstanceMethod(workspace_class, open_sensitive) != NULL) {
+		answer = send_bool(workspace, open_sensitive, address, NULL);
+	}
+	if (!answer && address != NULL && workspace != NULL &&
+	    class_getInstanceMethod(workspace_class, open_plain) != NULL) {
+		answer = send_bool(workspace, open_plain, address, NULL);
+	}
+	/*
+	 * -openSensitiveURL:withOptions: may well return nothing at all; p329 returned 0 and opened
+	 * the page anyway, so what is printed is what came back, not what happened.
+	 */
+	say("hakios: open: %s asked for (%s), answer %d\n", text,
+	    class_getInstanceMethod(workspace_class, open_sensitive) != NULL ? "openSensitiveURL is here" :
+	    "no openSensitiveURL", answer);
+}
+
+static void *
+open_later(void *unused)
+{
+	static char list[1024];
+	char *line, *end = NULL;
+	size_t got = 0;
+	unsigned previous = 0;
+	ssize_t n;
+	int fd;
+
+	(void)unused;
+	if ((fd = open("/redwood/etc/open.url", O_RDONLY, 0)) < 0) {
+		return NULL;
+	}
+	while (got < sizeof(list) - 1 && (n = read(fd, list + got, sizeof(list) - 1 - got)) > 0) {
+		got += (size_t)n;
+	}
+	close(fd);
+	list[got] = 0;
+	for (line = list; line != NULL && line[0] != 0; line = end != NULL ? end + 1 : NULL) {
+		unsigned when;
+		char *space;
+
+		end = strchr(line, '\n');
+		if (end != NULL) {
+			*end = 0;
+		}
+		space = strchr(line, ' ');
+		if (space == NULL) {
+			continue;
+		}
+		*space = 0;
+		when = (unsigned)strtoul(line, NULL, 10);
+		if (when < previous) {
+			when = previous;
+		}
+		if (when > previous) {
+			sleep(when - previous);
+			previous = when;
+		}
+		dispatch_async(dispatch_get_main_queue(), ^{
+			open_url(space + 1);
+		});
+	}
+	return NULL;
+}
+
+static void
+open_setup(void)
+{
+	pthread_t th;
+
+	if (access("/redwood/etc/open.url", F_OK) != 0) {
+		return;
+	}
+	say("hakios: open: the URLs of /redwood/etc/open.url are asked for in their time\n");
+	if (pthread_create(&th, NULL, open_later, NULL) == 0) {
+		pthread_detach(th);
+	}
+}
+
+/* ---- warming PosterBoard up before the home screen asks it for the wallpaper --------------- */
+
+/*
+ * Switch: /redwood/etc/hakios.posterwarm, the number of seconds into SpringBoard's life after
+ * which the poster daemon is asked for (25 if the file is empty).
+ *
+ * The wallpaper is drawn by PosterBoard, an application launchd only starts on demand (its job,
+ * com.apple.posterboardservices.services, is "the one that elided xpcproxy"), and p341 shows the
+ * order: the home screen appeared at 17:42:20 and PosterBoard's process at the same moment, with
+ * the wallpaper black until its poster and extension host were up a few seconds later.  A
+ * connection made while SpringBoard is still busy starts that chain early, so the poster is
+ * there when the home screen asks for it.
+ */
+static void *
+posterwarm_later(void *argument)
+{
+	unsigned when = (unsigned)(uintptr_t)argument;
+	xpc_connection_t_sb connection;
+
+	say("hakios: posterwarm: the thread is up, %u s to go\n", when);
+	sleep(when);
+	connection = xpc_connection_create_mach_service("com.apple.posterboardservices.services", NULL, 0);
+	if (connection == NULL) {
+		say("hakios: posterwarm: no connection to com.apple.posterboardservices.services\n");
+		return NULL;
+	}
+	xpc_connection_set_event_handler(connection, ^(xpc_object_t_sb event) { (void)event; });
+	xpc_connection_resume(connection);
+	say("hakios: posterwarm: %u s in, PosterBoard is asked for (pid %d)\n", when,
+	    xpc_connection_get_pid(connection));
+	/* the connection is kept: while it is open the daemon is not asked to go away */
+	return NULL;
+}
+
+static void
+posterwarm_setup(void)
+{
+	unsigned when = 25;
+	pthread_t th;
+	int fd;
+
+	if ((fd = open("/redwood/etc/hakios.posterwarm", O_RDONLY, 0)) < 0) {
+		return;
+	}
+	{
+		char text[32];
+		long got = read(fd, text, sizeof(text) - 1);
+
+		close(fd);
+		if (got > 0) {
+			text[got] = 0;
+			when = (unsigned)strtoul(text, NULL, 10);
+		}
+	}
+	if (when == 0) {
+		return;
+	}
+	say("hakios: posterwarm: PosterBoard is asked for at %u s\n", when);
+	if (pthread_create(&th, NULL, posterwarm_later, (void *)(uintptr_t)when) == 0) {
+		pthread_detach(th);
+	}
+}
+
+static void
+sb_milestones(void)
+{
+	Class c;
+	Method m;
+
+	hook_init_SBUIController(objc_getClass("SBUIController"));
+	hook_init_SBApplicationController(objc_getClass("SBApplicationController"));
+	hook_init_SBLockScreenManager(objc_getClass("SBLockScreenManager"));
+	hook_init_SBWallpaperController(objc_getClass("SBWallpaperController"));
+	hook_init_SBMainWorkspace(objc_getClass("SBMainWorkspace"));
+	hook_init_SBUserSessionController(objc_getClass("SBUserSessionController"));
+	hook_void_SBApplicationController(objc_getClass("SBApplicationController"));
+	hook_void_SBUIController(objc_getClass("SBUIController"));
+	if ((c = objc_getClass("SBHomeScreenViewController")) != NULL &&
+	    (m = class_getInstanceMethod(c, sel_registerName("viewDidAppear:"))) != NULL) {
+		orig_view_did_appear = (void *)method_getImplementation(m);
+		method_setImplementation(m, (IMP)log_view_did_appear);
+	}
+	say("hakios: SB milestones hooked\n");
+	url_path_fixes();
+	say_class_family("FSNode");
+	store_methods_setup();
+	nostore2_setup();
+	nodnd_setup();
+	noanon_setup();
+	unlock_setup();
+	open_setup();
+	posterwarm_setup();
+	store_wait_setup();
+	sb_xpc_timeout_setup();
+	watch_nsxpc();
+	say_symbols();
+	sample_watchdog();
+	lock_watchdogs();
+	bks_timeout_setup();
+	bs_setup();
+	loud_limit_setup();
+	xpc_watched = 1;
+	xpc_count = 1;
+	say("hakios: xpc watching\n");
+	wait_if_asked();
 }
 
 __attribute__((constructor))
@@ -1255,9 +3572,49 @@ hakios_springboard_init(void)
 	IMP activation, snapshot_format, battery_lvl, battery_st, poster_switcher;
 	int token;
 
+	int console_fd = open("/dev/console", O_WRONLY | O_NOCTTY);
+	if (console_fd >= 0) {
+		say_fd = console_fd;
+	}
+	/*
+	 * Boot-arg hakios_quiet=1: the window server's stdout and stderr to /dev/null, our own
+	 * lines still on the console.  A window server that writes a lot to the console can be
+	 * held back by it, and with it every frame.
+	 */
+	{
+		char arguments[1024] = "";
+		size_t arguments_size = sizeof(arguments) - 1;
+
+		if (sysctlbyname("kern.bootargs", arguments, &arguments_size, NULL, 0) == 0 &&
+		    strstr(arguments, "hakios_quiet=1") != NULL) {
+			int null = open("/dev/null", O_WRONLY);
+
+			if (null >= 0) {
+				dup2(null, 1);
+				dup2(null, 2);
+				if (null > 2) {
+					close(null);
+				}
+			}
+			say("hakios: %s[%d]: stdout and stderr are /dev/null (hakios_quiet=1)\n",
+			    getprogname(), getpid());
+		}
+	}
+
+	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
+	watch_for_faults();
+	{
+		void (*set_uncaught)(void (*)(id)) = (void (*)(void (*)(id)))dlsym(RTLD_DEFAULT, "NSSetUncaughtExceptionHandler");
+		if (set_uncaught != NULL) {
+			set_uncaught(hakios_exception_handler);
+		}
+	}
+	install_collection_safety_hooks();
+
 	if (name == NULL) {
 		return;
 	}
+	say("hakios: %s[%d] starting (slide %#lx)\n", name, getpid(), slide);
 	if (strcmp(name, "SpringBoard") != 0) {
 		static char who[64];
 
@@ -1272,6 +3629,7 @@ hakios_springboard_init(void)
 		});
 		return;
 	}
+	sb_milestones();
 	/*
 	 * The tweaks of the package manager's prefix, if one is installed: ElleKit's loader
 	 * (/var/jb/usr/lib/TweakLoader.dylib) reads /var/jb/usr/lib/TweakInject and opens the tweaks
@@ -1431,5 +3789,9 @@ hakios_springboard_init(void)
 	}
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
 		unlock();
+	});
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+		say("hakios: dumping SpringBoard layers after unlock:\n");
+		layers();
 	});
 }
