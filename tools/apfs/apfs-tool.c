@@ -36,6 +36,14 @@
 #include "apfs_lib.h"
 #include "apfs_write.h"
 #include "apfs_store.h"
+#include "apfs_txn_priv.h"
+
+/* The kernel's breadcrumbs are not part of this program; what calls them still is. */
+void
+apfs_why_append(const char *fmt, ...)
+{
+	(void)fmt;
+}
 
 /* ---- the image as a device ---- */
 
@@ -428,7 +436,10 @@ cmd_stat(const char *path, const char *where)
 	printf("path        %s\n", where);
 	printf("inode       %" PRIu64 "  parent %" PRIu64 "  private %" PRIu64 "\n",
 	    ino.obj_id, ino.parent_id, ino.private_id);
-	printf("mode        %06o  uid %u  gid %u\n", ino.mode, ino.owner, ino.group);
+	printf("mode        %06o  uid %u  gid %u  links %d\n", ino.mode, ino.owner,
+	    ino.group, ino.nchildren);
+	printf("time        created %" PRIu64 "  modified %" PRIu64 "  changed %" PRIu64 "\n",
+	    ino.create_time, ino.mod_time, ino.change_time);
 	printf("size        %" PRIu64 "  allocated %" PRIu64 "\n", ino.size,
 	    ino.alloced_size);
 	printf("flags       internal 0x%" PRIx64 "  bsd 0x%x%s\n", ino.internal_flags,
@@ -1529,6 +1540,1075 @@ cmd_writable(const char *path)
 }
 
 
+/* ---- a transaction (bsd/miscfs/apfs/apfs_txn.c) ---- */
+
+static int
+cmd_txn_mtime(const char *path, const char *where, const char *when_str)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	struct apfs_inode ino;
+	uint64_t id, when;
+	uint8_t dt;
+	int error;
+
+	want_write = true;
+	if (open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, where, &id, &dt);
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", where, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	error = apfs_inode_get(&vol, id, &ino);
+	if (error) {
+		fprintf(stderr, "apfs-tool: inode %" PRIu64 ": %s\n", id, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	when = when_str != NULL ? strtoull(when_str, NULL, 0) : ino.mod_time + 1000000000ULL;
+	printf("%s: inode %" PRIu64 " mod_time %" PRIu64 " -> %" PRIu64 " (xid %" PRIu64 ")\n",
+	    where, id, ino.mod_time, when, nx.xid);
+	error = apfs_inode_set_mod_time(&vol, id, when);
+	if (error) {
+		fprintf(stderr, "apfs-tool: the change was refused: %s\n", strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	printf("  committed as xid %" PRIu64 ", tree at block %" PRIu64 "\n", nx.xid, vol.tree.root);
+	apfs_nx_close(&nx);
+	return 0;
+}
+
+
+static int
+cmd_txn_create(const char *path, const char *dir, const char *name, const char *when_str,
+    const char *mode_str)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	uint64_t parent, new_id = 0;
+	uint64_t when = when_str != NULL ? strtoull(when_str, NULL, 0) : 1700000000ULL * 1000000000ULL;
+	uint16_t perm = mode_str != NULL ? (uint16_t)strtoul(mode_str, NULL, 8) : 0644;
+	uint8_t dt;
+	int error;
+
+	want_write = true;
+	if (open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, dir, &parent, &dt);
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", dir, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	error = apfs_create_file(&vol, parent, name, APFS_S_IFREG | (perm & 07777), 0, 0,
+	    when, &new_id);
+	if (error) {
+		fprintf(stderr, "apfs-tool: create %s/%s: %s\n", dir, name, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	printf("%s/%s: inode %" PRIu64 ", committed as xid %" PRIu64 "\n", dir, name, new_id, nx.xid);
+	apfs_nx_close(&nx);
+	return 0;
+}
+
+/*
+ * Several creates in one process, the volume opened once: what the kernel does between two
+ * operations, and what "one process per operation" never tested.
+ */
+static int
+cmd_txn_create_many(const char *path, const char *dir, int nnames, char **names)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	uint64_t parent, new_id = 0;
+	uint64_t when = 1700000000ULL * 1000000000ULL;
+	uint8_t dt;
+	int error, i;
+
+	want_write = true;
+	if (open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, dir, &parent, &dt);
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", dir, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	for (i = 0; i < nnames; i++) {
+		new_id = 0;
+		error = apfs_create_file(&vol, parent, names[i], APFS_S_IFREG | 0644, 0, 0,
+		    when, &new_id);
+		if (error) {
+			fprintf(stderr, "apfs-tool: create %s/%s (op %d): %s\n", dir, names[i],
+			    i + 1, strerror(error));
+			apfs_nx_close(&nx);
+			return 1;
+		}
+		printf("%s/%s: inode %" PRIu64 ", committed as xid %" PRIu64 "\n", dir,
+		    names[i], new_id, nx.xid);
+	}
+	apfs_nx_close(&nx);
+	return 0;
+}
+
+static int
+cmd_txn_unlink(const char *path, const char *dir, const char *name, const char *when_str)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	uint64_t parent;
+	uint64_t when = when_str != NULL ? strtoull(when_str, NULL, 0) : 1700000000ULL * 1000000000ULL;
+	uint8_t dt;
+	int error;
+
+	want_write = true;
+	if (open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, dir, &parent, &dt);
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", dir, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	error = apfs_unlink(&vol, parent, name, when);
+	if (error) {
+		fprintf(stderr, "apfs-tool: unlink %s/%s: %s\n", dir, name, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	printf("%s/%s: removed, committed as xid %" PRIu64 "\n", dir, name, nx.xid);
+	apfs_nx_close(&nx);
+	return 0;
+}
+
+
+static int
+cmd_txn_alloc(const char *path, const char *n_str)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	struct apfs_spaceman sm;
+	struct apfs_txn *txn;
+	uint64_t at[64];
+	uint32_t n = (uint32_t)strtoul(n_str, NULL, 0), i;
+	int error;
+
+	want_write = true;
+	if (open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	error = apfs_spaceman_open(&nx, &sm);
+	if (error) {
+		fprintf(stderr, "apfs-tool: no space manager: %s\n", strerror(error));
+		return 1;
+	}
+	txn = apfs_txn_begin(&nx, &sm);
+	if (txn == NULL) {
+		fprintf(stderr, "apfs-tool: no transaction\n");
+		return 1;
+	}
+	if (n > 64) {
+		n = 64;
+	}
+	error = apfs_txn_alloc_block(txn, &at[0]);
+	if (!error && n > 1) {
+		/* one at a time: what the tree writer does */
+		for (i = 1; i < n; i++) {
+			error = apfs_txn_alloc_block(txn, &at[i]);
+			if (error) {
+				break;
+			}
+		}
+	}
+	if (error) {
+		fprintf(stderr, "apfs-tool: allocation: %s\n", strerror(error));
+		return 1;
+	}
+	for (i = 0; i < n; i++) {
+		printf("block %" PRIu64 "\n", at[i]);
+	}
+	printf("free now %" PRIu64 "\n", sm.free_count);
+	apfs_txn_abort(txn);
+	apfs_spaceman_close(&sm);
+	apfs_nx_close(&nx);
+	return 0;
+}
+
+
+static int
+cmd_txn_append(const char *path, const char *where, const char *from, const char *when_str)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	uint64_t id, when = when_str != NULL ? strtoull(when_str, NULL, 0) :
+	    1700000000ULL * 1000000000ULL;
+	uint8_t dt;
+	uint8_t *data = NULL;
+	size_t len = 0, cap = 0;
+	FILE *f;
+	int error;
+
+	f = strcmp(from, "-") == 0 ? stdin : fopen(from, "rb");
+	if (f == NULL) {
+		perror(from);
+		return 1;
+	}
+	for (;;) {
+		size_t n;
+
+		if (len == cap) {
+			uint8_t *p;
+
+			cap = cap != 0 ? cap * 2 : 65536;
+			p = realloc(data, cap);
+			if (p == NULL) {
+				fprintf(stderr, "apfs-tool: no memory\n");
+				return 1;
+			}
+			data = p;
+		}
+		n = fread(data + len, 1, cap - len, f);
+		if (n == 0) {
+			break;
+		}
+		len += n;
+	}
+	if (f != stdin) {
+		fclose(f);
+	}
+	want_write = true;
+	if (open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, where, &id, &dt);
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", where, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	error = apfs_append_file(&vol, id, data, len, when);
+	if (error) {
+		fprintf(stderr, "apfs-tool: append %s: %s\n", where, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	printf("%s: %zu bytes appended, committed as xid %" PRIu64 "\n", where, len, nx.xid);
+	apfs_nx_close(&nx);
+	free(data);
+	return 0;
+}
+
+
+/*
+ * A write at an offset: the path the kernel's VNOP_WRITE takes (apfs_write_data), which
+ * appends do not -- it fills holes, splits holes that have records, and reuses the block a
+ * file already ends in.  The `write` command above is the older byte writer.
+ */
+static int
+cmd_txn_write(const char *path, const char *where, const char *off_str, const char *from,
+    const char *when_str)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	uint64_t id, off = strtoull(off_str, NULL, 0);
+	uint64_t when = when_str != NULL ? strtoull(when_str, NULL, 0) :
+	    1700000000ULL * 1000000000ULL;
+	uint8_t dt;
+	uint8_t *data = NULL;
+	size_t len = 0, cap = 0;
+	FILE *f;
+	int error;
+
+	f = strcmp(from, "-") == 0 ? stdin : fopen(from, "rb");
+	if (f == NULL) {
+		perror(from);
+		return 1;
+	}
+	for (;;) {
+		size_t n;
+
+		if (len == cap) {
+			uint8_t *p;
+
+			cap = cap != 0 ? cap * 2 : 65536;
+			p = realloc(data, cap);
+			if (p == NULL) {
+				fprintf(stderr, "apfs-tool: no memory\n");
+				return 1;
+			}
+			data = p;
+		}
+		n = fread(data + len, 1, cap - len, f);
+		if (n == 0) {
+			break;
+		}
+		len += n;
+	}
+	if (f != stdin) {
+		fclose(f);
+	}
+	want_write = true;
+	if (open_image(path, &nx, &vol) != 0) {
+		free(data);
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, where, &id, &dt);
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", where, strerror(error));
+		apfs_nx_close(&nx);
+		free(data);
+		return 1;
+	}
+	error = apfs_write_data(&vol, id, off, data, len, when);
+	if (error) {
+		fprintf(stderr, "apfs-tool: write %s at %" PRIu64 ": %s\n", where, off,
+		    strerror(error));
+		apfs_nx_close(&nx);
+		free(data);
+		return 1;
+	}
+	printf("%s: %zu bytes at %" PRIu64 ", committed as xid %" PRIu64 "\n", where, len, off,
+	    nx.xid);
+	apfs_nx_close(&nx);
+	free(data);
+	return 0;
+}
+
+
+/*
+ * Many changes in one session: the image is opened once and every line of the script is a
+ * transaction on the same volume, as on a mounted volume in the kernel.  The other txn-*
+ * commands open the image anew for each change, which is right for what they test but hides
+ * everything that depends on the state a mount keeps -- the roots the transaction leaves in
+ * memory, the object map's cached blocks.  A workload that only goes wrong after thousands of
+ * changes in one mount is what this is for.
+ *
+ * Lines: op arguments..., '#' starts a comment.  Paths are looked up from the volume's root.
+ */
+static uint8_t
+batch_byte(unsigned seed, uint64_t at)
+{
+	uint64_t x = seed * 6364136223846793005ULL + at * 1442695040888963407ULL + 0x9e3779b97f4a7c15ULL;
+
+	x ^= x >> 29;
+	x *= 0xbf58476d1ce4e5b9ULL;
+	return (uint8_t)(x >> 56);
+}
+
+static int
+cmd_batch(const char *path, const char *script)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	uint64_t when = 1700000000ULL * 1000000000ULL;
+	FILE *f;
+	char line[1024];
+	int lineno = 0, rc = 0;
+
+	f = fopen(script, "r");
+	if (f == NULL) {
+		perror(script);
+		return 1;
+	}
+	want_write = true;
+	if (open_image(path, &nx, &vol) != 0) {
+		fclose(f);
+		return 1;
+	}
+	while (fgets(line, sizeof(line), f) != NULL) {
+		char *argv[8];
+		int argc = 0;
+		uint64_t id = 0, parent = 0, when_arg;
+		uint8_t dt;
+		int error = 0;
+		char *p = line;
+
+		lineno++;
+		if ((p = strchr(p, '#')) != NULL) {
+			*p = 0;
+		}
+		for (p = strtok(line, " \t\r\n"); p != NULL && argc < 8; p = strtok(NULL, " \t\r\n")) {
+			argv[argc++] = p;
+		}
+		if (argc == 0) {
+			continue;
+		}
+		if (strcmp(argv[0], "create") == 0 && argc == 3) {
+			error = apfs_path_lookup(&vol, argv[1], &parent, &dt);
+			if (error == 0) {
+				error = apfs_create_file(&vol, parent, argv[2], APFS_S_IFREG | 0644,
+				    0, 0, when, &id);
+			}
+		} else if (strcmp(argv[0], "mkdir") == 0 && argc >= 3) {
+			error = apfs_path_lookup(&vol, argv[1], &parent, &dt);
+			if (error == 0) {
+				error = apfs_mkdir(&vol, parent, argv[2], APFS_S_IFDIR | 0755, 0, 0,
+				    when, &id);
+			}
+		} else if (strcmp(argv[0], "rmdir") == 0 && argc == 3) {
+			error = apfs_path_lookup(&vol, argv[1], &parent, &dt);
+			if (error == 0) {
+				error = apfs_rmdir(&vol, parent, argv[2], when);
+			}
+		} else if (strcmp(argv[0], "unlink") == 0 && argc == 3) {
+			error = apfs_path_lookup(&vol, argv[1], &parent, &dt);
+			if (error == 0) {
+				error = apfs_unlink(&vol, parent, argv[2], when);
+			}
+		} else if (strcmp(argv[0], "unlinkkeep") == 0 && argc == 3) {
+			error = apfs_path_lookup(&vol, argv[1], &parent, &dt);
+			if (error == 0) {
+				error = apfs_unlink_keep(&vol, parent, argv[2], when);
+			}
+		} else if (strcmp(argv[0], "delete") == 0 && argc == 2) {
+			/* the inode of a file whose last name went with unlinkkeep */
+			error = apfs_path_lookup(&vol, argv[1], &id, &dt);
+			if (error == 0) {
+				error = apfs_delete_inode(&vol, id, when);
+			}
+		} else if (strcmp(argv[0], "rename") == 0 && argc == 5) {
+			uint64_t new_parent = 0;
+
+			error = apfs_path_lookup(&vol, argv[1], &parent, &dt);
+			if (error == 0) {
+				error = apfs_path_lookup(&vol, argv[3], &new_parent, &dt);
+			}
+			if (error == 0) {
+				error = apfs_rename(&vol, parent, argv[2], new_parent, argv[4], when);
+			}
+		} else if (strcmp(argv[0], "link") == 0 && argc == 4) {
+			uint64_t target = 0;
+
+			error = apfs_path_lookup(&vol, argv[1], &parent, &dt);
+			if (error == 0) {
+				error = apfs_path_lookup(&vol, argv[3], &target, &dt);
+			}
+			if (error == 0) {
+				error = apfs_link(&vol, parent, argv[2], target, when);
+			}
+		} else if (strcmp(argv[0], "symlink") == 0 && argc == 4) {
+			error = apfs_path_lookup(&vol, argv[1], &parent, &dt);
+			if (error == 0) {
+				error = apfs_create_file(&vol, parent, argv[2],
+				    APFS_S_IFLNK | 0777, 0, 0, when, &id);
+			}
+			if (error == 0) {
+				error = apfs_setxattr(&vol, id, APFS_SYMLINK_EA_NAME, argv[3],
+				    strlen(argv[3]), APFS_XATTR_FILE_SYSTEM_OWNED, when);
+			}
+		} else if (strcmp(argv[0], "truncate") == 0 && argc == 3) {
+			error = apfs_path_lookup(&vol, argv[1], &id, &dt);
+			if (error == 0) {
+				error = apfs_truncate(&vol, id, strtoull(argv[2], NULL, 0), when);
+			}
+		} else if (strcmp(argv[0], "write") == 0 && argc == 4) {
+			uint64_t at = strtoull(argv[2], NULL, 0);
+			size_t len = (size_t)strtoull(argv[3], NULL, 0);
+			uint8_t *data = malloc(len != 0 ? len : 1);
+			size_t i;
+
+			if (data == NULL) {
+				error = ENOMEM;
+			} else {
+				for (i = 0; i < len; i++) {
+					data[i] = batch_byte((unsigned)at, i);
+				}
+				error = apfs_path_lookup(&vol, argv[1], &id, &dt);
+				if (error == 0) {
+					error = apfs_write_data(&vol, id, at, data, len, when);
+				}
+				free(data);
+			}
+		} else if (strcmp(argv[0], "append") == 0 && argc == 3) {
+			size_t len = (size_t)strtoull(argv[2], NULL, 0);
+			uint8_t *data = malloc(len != 0 ? len : 1);
+			size_t i;
+
+			if (data == NULL) {
+				error = ENOMEM;
+			} else {
+				for (i = 0; i < len; i++) {
+					data[i] = batch_byte(7, i);
+				}
+				error = apfs_path_lookup(&vol, argv[1], &id, &dt);
+				if (error == 0) {
+					error = apfs_append_file(&vol, id, data, len, when);
+				}
+				free(data);
+			}
+		} else if (strcmp(argv[0], "setxattr") == 0 && argc == 4) {
+			size_t len = (size_t)strtoull(argv[3], NULL, 0);
+			uint8_t *data = malloc(len != 0 ? len : 1);
+			size_t i;
+
+			if (data == NULL) {
+				error = ENOMEM;
+			} else {
+				for (i = 0; i < len; i++) {
+					data[i] = batch_byte(11, i);
+				}
+				error = apfs_path_lookup(&vol, argv[1], &id, &dt);
+				if (error == 0) {
+					error = apfs_setxattr(&vol, id, argv[2], data, len, 0, when);
+				}
+				free(data);
+			}
+		} else if (strcmp(argv[0], "rmxattr") == 0 && argc == 3) {
+			error = apfs_path_lookup(&vol, argv[1], &id, &dt);
+			if (error == 0) {
+				error = apfs_removexattr(&vol, id, argv[2], when);
+			}
+		} else if (strcmp(argv[0], "mtime") == 0 && argc == 3) {
+			struct apfs_setattr sa;
+
+			when_arg = strtoull(argv[2], NULL, 0);
+			memset(&sa, 0, sizeof(sa));
+			sa.mtime_set = true;
+			sa.mtime = when_arg;
+			error = apfs_path_lookup(&vol, argv[1], &id, &dt);
+			if (error == 0) {
+				error = apfs_inode_setattr(&vol, id, &sa, when);
+			}
+		} else {
+			fprintf(stderr, "apfs-tool: line %d: not a step: %s\n", lineno, argv[0]);
+			rc = 1;
+			break;
+		}
+		if (error) {
+			fprintf(stderr, "apfs-tool: line %d '%s %s %s %s': %s (xid %" PRIu64 ")\n",
+			    lineno, argv[0], argc > 1 ? argv[1] : "",
+			    argc > 2 ? argv[2] : "", argc > 3 ? argv[3] : "",
+			    strerror(error), nx.xid);
+			rc = 1;
+			break;
+		}
+	}
+	fclose(f);
+	apfs_nx_close(&nx);
+	if (rc == 0) {
+		printf("the whole script went through\n");
+	}
+	return rc;
+}
+
+
+static int
+cmd_txn_mkdir(const char *path, const char *dir, const char *name, const char *when_str)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	uint64_t parent, id = 0;
+	uint64_t when = when_str != NULL ? strtoull(when_str, NULL, 0) : 1700000000ULL * 1000000000ULL;
+	uint8_t dt;
+	int error;
+
+	want_write = true;
+	if (open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, dir, &parent, &dt);
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", dir, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	error = apfs_mkdir(&vol, parent, name, APFS_S_IFDIR | 0755, 0, 0, when, &id);
+	if (error) {
+		fprintf(stderr, "apfs-tool: mkdir %s/%s: %s\n", dir, name, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	printf("%s/%s: inode %" PRIu64 ", committed as xid %" PRIu64 "\n", dir, name, id, nx.xid);
+	apfs_nx_close(&nx);
+	return 0;
+}
+
+static int
+cmd_txn_rmdir(const char *path, const char *dir, const char *name, const char *when_str)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	uint64_t parent;
+	uint64_t when = when_str != NULL ? strtoull(when_str, NULL, 0) : 1700000000ULL * 1000000000ULL;
+	uint8_t dt;
+	int error;
+
+	want_write = true;
+	if (open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, dir, &parent, &dt);
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", dir, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	error = apfs_rmdir(&vol, parent, name, when);
+	if (error) {
+		fprintf(stderr, "apfs-tool: rmdir %s/%s: %s\n", dir, name, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	printf("%s/%s: removed, committed as xid %" PRIu64 "\n", dir, name, nx.xid);
+	apfs_nx_close(&nx);
+	return 0;
+}
+
+
+static int
+cmd_txn_repack(const char *path, const char *where)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	uint64_t id;
+	uint8_t dt;
+	bool same = false;
+	int error;
+
+	want_write = true;
+	if (open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, where, &id, &dt);
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", where, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	error = apfs_inode_repack_check(&vol, id, &same, 1700000000ULL * 1000000000ULL);
+	if (error) {
+		fprintf(stderr, "apfs-tool: repack %s: %s\n", where, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	printf("%s: inode %" PRIu64 " repacked, %s (xid %" PRIu64 ")\n", where, id,
+	    same ? "bytes identical" : "BYTES DIFFER", nx.xid);
+	apfs_nx_close(&nx);
+	return same ? 0 : 1;
+}
+
+
+static int
+cmd_txn_link(const char *path, const char *dir, const char *name, const char *target,
+    const char *when_str)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	uint64_t parent, id;
+	uint64_t when = when_str != NULL ? strtoull(when_str, NULL, 0) :
+	    1700000000ULL * 1000000000ULL;
+	uint8_t dt;
+	int error;
+
+	want_write = true;
+	if (open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, dir, &parent, &dt);
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", dir, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, target, &id, &dt);
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", target, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	error = apfs_link(&vol, parent, name, id, when);
+	if (error) {
+		fprintf(stderr, "apfs-tool: link %s/%s -> %s: %s\n", dir, name, target,
+		    strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	printf("%s/%s: linked to %s, committed as xid %" PRIu64 "\n", dir, name, target,
+	    nx.xid);
+	apfs_nx_close(&nx);
+	return 0;
+}
+
+static int
+cmd_txn_symlink(const char *path, const char *dir, const char *name, const char *target,
+    const char *when_str)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	uint64_t parent, id = 0;
+	uint64_t when = when_str != NULL ? strtoull(when_str, NULL, 0) :
+	    1700000000ULL * 1000000000ULL;
+	uint8_t dt;
+	int error;
+
+	want_write = true;
+	if (open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, dir, &parent, &dt);
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", dir, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	error = apfs_create_file(&vol, parent, name, APFS_S_IFLNK | 0777, 0, 0, when, &id);
+	if (error == 0) {
+		error = apfs_setxattr(&vol, id, APFS_SYMLINK_EA_NAME, target, strlen(target),
+		    APFS_XATTR_FILE_SYSTEM_OWNED, when);
+	}
+	if (error) {
+		fprintf(stderr, "apfs-tool: symlink %s/%s -> %s: %s\n", dir, name, target,
+		    strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	printf("%s/%s -> %s: committed as xid %" PRIu64 "\n", dir, name, target, nx.xid);
+	apfs_nx_close(&nx);
+	return 0;
+}
+
+/* Does this look like a number an optional argument could be? */
+static bool
+tool_is_number(const char *s)
+{
+	char *end;
+
+	if (s == NULL || *s == '\0') {
+		return false;
+	}
+	(void)strtoull(s, &end, 0);
+	return *end == '\0';
+}
+
+
+static int
+cmd_txn_rename(const char *path, const char *dir, const char *name, const char *newdir,
+    const char *newname, const char *when_str)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	uint64_t parent, new_parent;
+	uint64_t when = when_str != NULL ? strtoull(when_str, NULL, 0) :
+	    1700000000ULL * 1000000000ULL;
+	uint8_t dt;
+	int error;
+
+	want_write = true;
+	if (open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, dir, &parent, &dt);
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", dir, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, newdir, &new_parent, &dt);
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", newdir, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	error = apfs_rename(&vol, parent, name, new_parent, newname, when);
+	if (error) {
+		fprintf(stderr, "apfs-tool: rename %s/%s -> %s/%s: %s\n", dir, name, newdir,
+		    newname, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	printf("%s/%s -> %s/%s: committed as xid %" PRIu64 "\n", dir, name, newdir, newname,
+	    nx.xid);
+	apfs_nx_close(&nx);
+	return 0;
+}
+
+
+static int
+cmd_txn_truncate(const char *path, const char *where, const char *size_str,
+    const char *when_str)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	struct apfs_inode ino;
+	uint64_t id, size = strtoull(size_str, NULL, 0);
+	uint64_t when = when_str != NULL ? strtoull(when_str, NULL, 0) :
+	    1700000000ULL * 1000000000ULL;
+	uint8_t dt;
+	int error;
+
+	want_write = true;
+	if (open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, where, &id, &dt);
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", where, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	error = apfs_inode_get(&vol, id, &ino);
+	if (error) {
+		fprintf(stderr, "apfs-tool: inode %" PRIu64 ": %s\n", id, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	printf("%s: inode %" PRIu64 " size %" PRIu64 " (alloced %" PRIu64 ") -> %" PRIu64 "\n",
+	    where, id, ino.size, ino.alloced_size, size);
+	error = apfs_truncate(&vol, id, size, when);
+	if (error) {
+		fprintf(stderr, "apfs-tool: truncate %s: %s\n", where, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	printf("  committed as xid %" PRIu64 ", tree at block %" PRIu64 "\n", nx.xid, vol.tree.root);
+	apfs_nx_close(&nx);
+	return 0;
+}
+
+/* The whole of a file or of standard input: what an attribute's value comes from. */
+static uint8_t *
+tool_read_all(const char *from, size_t *len)
+{
+	uint8_t *data = NULL, *p;
+	size_t cap = 0;
+	FILE *f = strcmp(from, "-") == 0 ? stdin : fopen(from, "rb");
+
+	*len = 0;
+	if (f == NULL) {
+		perror(from);
+		return NULL;
+	}
+	for (;;) {
+		size_t n;
+
+		if (*len == cap) {
+			cap = cap != 0 ? cap * 2 : 65536;
+			p = realloc(data, cap);
+			if (p == NULL) {
+				fprintf(stderr, "apfs-tool: no memory\n");
+				free(data);
+				return NULL;
+			}
+			data = p;
+		}
+		n = fread(data + *len, 1, cap - *len, f);
+		if (n == 0) {
+			break;
+		}
+		*len += n;
+	}
+	if (f != stdin) {
+		fclose(f);
+	}
+	return data;
+}
+
+static int
+cmd_txn_setxattr(const char *path, const char *where, const char *name, const char *from,
+    const char *flags_str, const char *when_str)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	uint64_t id;
+	uint64_t when = when_str != NULL ? strtoull(when_str, NULL, 0) :
+	    1700000000ULL * 1000000000ULL;
+	uint16_t flags = flags_str != NULL ? (uint16_t)strtoul(flags_str, NULL, 0) : 0;
+	uint8_t *data;
+	size_t len = 0;
+	uint8_t dt;
+	int error;
+
+	data = tool_read_all(from, &len);
+	if (data == NULL) {
+		return 1;
+	}
+	want_write = true;
+	if (open_image(path, &nx, &vol) != 0) {
+		free(data);
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, where, &id, &dt);
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", where, strerror(error));
+		apfs_nx_close(&nx);
+		free(data);
+		return 1;
+	}
+	error = apfs_setxattr(&vol, id, name, data, len, flags, when);
+	if (error) {
+		fprintf(stderr, "apfs-tool: setxattr %s %s: %s\n", where, name, strerror(error));
+		apfs_nx_close(&nx);
+		free(data);
+		return 1;
+	}
+	printf("%s: %s = %zu bytes (flags 0x%x), committed as xid %" PRIu64 "\n", where, name,
+	    len, flags, nx.xid);
+	apfs_nx_close(&nx);
+	free(data);
+	return 0;
+}
+
+static int
+cmd_txn_rmxattr(const char *path, const char *where, const char *name, const char *when_str)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	uint64_t id;
+	uint64_t when = when_str != NULL ? strtoull(when_str, NULL, 0) :
+	    1700000000ULL * 1000000000ULL;
+	uint8_t dt;
+	int error;
+
+	want_write = true;
+	if (open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, where, &id, &dt);
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", where, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	error = apfs_removexattr(&vol, id, name, when);
+	if (error) {
+		fprintf(stderr, "apfs-tool: rmxattr %s %s: %s\n", where, name, strerror(error));
+		apfs_nx_close(&nx);
+		return 1;
+	}
+	printf("%s: %s removed, committed as xid %" PRIu64 "\n", where, name, nx.xid);
+	apfs_nx_close(&nx);
+	return 0;
+}
+
+/* ---- the space manager ---- */
+
+/*
+ * What the space manager says about a container: how many blocks there are, how many it
+ * calls free, and whether that agrees with the chunk bitmaps block for block.  The last
+ * part is the one that matters: it is the check that a writer's idea of a free block is
+ * the image's, and tools/apfs/txn-probe.py and apfsck agree with it or not.
+ */
+static int
+cmd_spaceman(const char *path, bool chunks)
+{
+	struct apfs_nx nx;
+	struct apfs_dev dev;
+	struct apfs_spaceman sm;
+	struct apfs_chunk_info ci;
+	uint64_t bitmap_free = 0, chunk_free = 0, block, blocks;
+	uint32_t i, bit, bad = 0;
+	int fd, error;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		perror(path);
+		return 1;
+	}
+	memset(&dev, 0, sizeof(dev));
+	dev.ctx = (void *)(intptr_t)fd;
+	dev.size = (uint64_t)lseek(fd, 0, SEEK_END);
+	dev.read = file_read;
+	dev.read_data = file_read;
+	error = apfs_nx_open(&nx, &dev);
+	if (error) {
+		fprintf(stderr, "apfs-tool: cannot read the container: %s\n", strerror(error));
+		close(fd);
+		return 1;
+	}
+	error = apfs_spaceman_open(&nx, &sm);
+	if (error) {
+		fprintf(stderr, "apfs-tool: no space manager: %s\n", strerror(error));
+		apfs_nx_close(&nx);
+		close(fd);
+		return 1;
+	}
+	printf("%s: %" PRIu64 " blocks of %u bytes, checkpoint xid %" PRIu64 "\n", path,
+	    sm.block_count, sm.block_size, sm.xid);
+	printf("  space manager: %u bytes at xid %" PRIu64 ", %u chunk%s of %u blocks\n",
+	    sm.sm_size, sm.xid, sm.chunk_count, sm.chunk_count == 1 ? "" : "s",
+	    sm.blocks_per_chunk);
+	printf("  chunk-info blocks %u, address blocks %u, address array at %u\n",
+	    sm.cib_count, sm.cab_count, sm.addr_offset);
+	printf("  free: %" PRIu64 " of %" PRIu64 " blocks (%.2f%%)\n", sm.free_count,
+	    sm.block_count, sm.block_count ? 100.0 * (double)sm.free_count / (double)sm.block_count : 0.0);
+	printf("  internal pool: %" PRIu64 " blocks at %" PRIu64 ", bitmap %u block%s, ring %u at %"
+	    PRIu64 ", head %u tail %u\n", sm.ip_block_count, sm.ip_base, sm.ip_bm_size_in_blocks,
+	    sm.ip_bm_size_in_blocks == 1 ? "" : "s", sm.ip_bm_block_count, sm.ip_bm_base,
+	    sm.ip_bm_free_head, sm.ip_bm_free_tail);
+
+	for (i = 0; i < sm.chunk_count; i++) {
+		const uint8_t *bitmap;
+		uint64_t free_in_bitmap = 0;
+
+		if (apfs_spaceman_chunk(&sm, i, &ci) != 0) {
+			printf("  chunk %u: cannot be read\n", i);
+			bad++;
+			continue;
+		}
+		chunk_free += ci.ci_free_count;
+		if (apfs_spaceman_bitmap(&sm, &ci, &bitmap) != 0) {
+			printf("  chunk %u: its bitmap cannot be read\n", i);
+			bad++;
+			continue;
+		}
+		for (bit = 0; bit < ci.ci_block_count; bit++) {
+			if (bitmap == NULL || ((bitmap[bit >> 3] >> (bit & 7)) & 1) == 0) {
+				free_in_bitmap++;
+			}
+		}
+		bitmap_free += free_in_bitmap;
+		if (chunks) {
+			printf("  chunk %u: blocks %" PRIu64 "..%" PRIu64 ", %u free, bitmap %"
+			    PRIu64 "\n", i, (uint64_t)ci.ci_addr,
+			    (uint64_t)ci.ci_addr + ci.ci_block_count - 1, ci.ci_free_count,
+			    (uint64_t)ci.ci_bitmap_addr);
+		}
+		if (free_in_bitmap != ci.ci_free_count) {
+			printf("  chunk %u: the record says %u free, the bitmap %" PRIu64 "\n",
+			    i, ci.ci_free_count, free_in_bitmap);
+			bad++;
+		}
+	}
+	if (chunk_free != sm.free_count) {
+		printf("  the chunk records add up to %" PRIu64 " free, the manager says %" PRIu64 "\n",
+		    chunk_free, sm.free_count);
+		bad++;
+	}
+	if (bitmap_free != sm.free_count) {
+		printf("  the bitmaps add up to %" PRIu64 " free, the manager says %" PRIu64 "\n",
+		    bitmap_free, sm.free_count);
+		bad++;
+	}
+
+	/* locate() by bisection against the chunk records, on a handful of blocks */
+	blocks = sm.block_count < 64 ? sm.block_count : 64;
+	for (block = 0; block < blocks; block++) {
+		bool used = false;
+		uint32_t chunk, at;
+
+		if (apfs_spaceman_locate(&sm, block, &chunk, &at) != 0 ||
+		    apfs_spaceman_block_used(&sm, block, &used) != 0) {
+			printf("  block %" PRIu64 ": not placed by the bisection\n", block);
+			bad++;
+		}
+	}
+
+	printf("  %s\n", bad == 0 ? "the manager, the chunk records and the bitmaps agree"
+	    : "MISMATCHES above");
+	apfs_spaceman_close(&sm);
+	apfs_nx_close(&nx);
+	close(fd);
+	return bad == 0 ? 0 : 1;
+}
+
 /* ---- the store of fixed-length slot files (bsd/miscfs/apfs/apfs_store.c) ---- */
 
 #define STORE_SCRATCH (1u << 20)
@@ -1702,6 +2782,18 @@ cmd_store_load(const char *path, const char *to)
 	return 0;
 }
 
+/*
+ * The kernel's own name of the calling process: apfs_fs_write.c asks for it once, in the log line
+ * of a rename.  On this machine there is no such thing, and the name is only read by a reader.
+ */
+void
+proc_selfname(char *buf, int size)
+{
+	if (size > 0) {
+		snprintf(buf, (size_t)size, "apfs-tool");
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1729,6 +2821,18 @@ main(int argc, char **argv)
 		    "       apfs-tool cat    IMAGE PATH\n"
 		    "       apfs-tool census IMAGE [PATH] [--meta]\n"
 		    "       apfs-tool write  IMAGE PATH OFFSET FILE|- [--fail-after N | --corrupt-after N]\n"
+		    "       apfs-tool txn-mtime IMAGE PATH [SECONDS]\n"
+		    "       apfs-tool txn-create IMAGE DIR NAME [SECONDS [MODE]]\n"
+		    "       apfs-tool txn-create-many IMAGE DIR NAME...\n"
+		    "       apfs-tool txn-unlink IMAGE DIR NAME [SECONDS]\n"
+		    "       apfs-tool txn-repack IMAGE PATH\n"
+		    "       apfs-tool txn-rename IMAGE DIR NAME NEWDIR [NEWNAME] [SECONDS]\n"
+		    "       apfs-tool txn-truncate IMAGE PATH SIZE [SECONDS]\n"
+		    "       apfs-tool txn-link IMAGE DIR NAME TARGET [SECONDS]\n"
+		    "       apfs-tool txn-symlink IMAGE DIR NAME TARGET [SECONDS]\n"
+		    "       apfs-tool txn-setxattr IMAGE PATH NAME FILE|- [FLAGS] [SECONDS]\n"
+		    "       apfs-tool txn-rmxattr IMAGE PATH NAME [SECONDS]\n"
+		    "       apfs-tool spaceman IMAGE [--chunks]\n"
 		    "       apfs-tool writable IMAGE\n"
 		    "       apfs-tool store  info IMAGE | save IMAGE FILE|- [NOTE] | load IMAGE FILE|-\n"
 		    "       apfs-tool lookups IMAGE\n"
@@ -1755,6 +2859,73 @@ main(int argc, char **argv)
 	}
 	if (strcmp(argv[1], "write") == 0 && argc > 5) {
 		return cmd_write(argv[2], argv[3], argv[4], argv[5]);
+	}
+	if (strcmp(argv[1], "txn-mtime") == 0 && argc > 3) {
+		return cmd_txn_mtime(argv[2], argv[3], argc > 4 ? argv[4] : NULL);
+	}
+	if (strcmp(argv[1], "txn-create") == 0 && argc > 4) {
+		return cmd_txn_create(argv[2], argv[3], argv[4], argc > 5 ? argv[5] : NULL,
+		    argc > 6 ? argv[6] : NULL);
+	}
+	if (strcmp(argv[1], "txn-create-many") == 0 && argc > 5) {
+		return cmd_txn_create_many(argv[2], argv[3], argc - 4, argv + 4);
+	}
+	if (strcmp(argv[1], "txn-unlink") == 0 && argc > 4) {
+		return cmd_txn_unlink(argv[2], argv[3], argv[4], argc > 5 ? argv[5] : NULL);
+	}
+	if (strcmp(argv[1], "txn-alloc") == 0 && argc > 3) {
+		return cmd_txn_alloc(argv[2], argv[3]);
+	}
+	if (strcmp(argv[1], "txn-append") == 0 && argc > 4) {
+		return cmd_txn_append(argv[2], argv[3], argv[4], argc > 5 ? argv[5] : NULL);
+	}
+	if (strcmp(argv[1], "txn-write") == 0 && argc > 5) {
+		return cmd_txn_write(argv[2], argv[3], argv[4], argv[5],
+		    argc > 6 ? argv[6] : NULL);
+	}
+	if (strcmp(argv[1], "batch") == 0 && argc > 3) {
+		return cmd_batch(argv[2], argv[3]);
+	}
+	if (strcmp(argv[1], "txn-mkdir") == 0 && argc > 4) {
+		return cmd_txn_mkdir(argv[2], argv[3], argv[4], argc > 5 ? argv[5] : NULL);
+	}
+	if (strcmp(argv[1], "txn-rmdir") == 0 && argc > 4) {
+		return cmd_txn_rmdir(argv[2], argv[3], argv[4], argc > 5 ? argv[5] : NULL);
+	}
+	if (strcmp(argv[1], "txn-repack") == 0 && argc > 3) {
+		return cmd_txn_repack(argv[2], argv[3]);
+	}
+	if (strcmp(argv[1], "txn-rename") == 0 && argc > 5) {
+		const char *newname = argv[4], *when = NULL;
+
+		if (argc > 6) {
+			if (tool_is_number(argv[6]) && argc == 7) {
+				when = argv[6];
+			} else {
+				newname = argv[6];
+				when = argc > 7 ? argv[7] : NULL;
+			}
+		}
+		return cmd_txn_rename(argv[2], argv[3], argv[4], argv[5], newname, when);
+	}
+	if (strcmp(argv[1], "txn-truncate") == 0 && argc > 4) {
+		return cmd_txn_truncate(argv[2], argv[3], argv[4], argc > 5 ? argv[5] : NULL);
+	}
+	if (strcmp(argv[1], "txn-link") == 0 && argc > 5) {
+		return cmd_txn_link(argv[2], argv[3], argv[4], argv[5], argc > 6 ? argv[6] : NULL);
+	}
+	if (strcmp(argv[1], "txn-symlink") == 0 && argc > 5) {
+		return cmd_txn_symlink(argv[2], argv[3], argv[4], argv[5], argc > 6 ? argv[6] : NULL);
+	}
+	if (strcmp(argv[1], "txn-setxattr") == 0 && argc > 5) {
+		return cmd_txn_setxattr(argv[2], argv[3], argv[4], argv[5],
+		    argc > 6 ? argv[6] : NULL, argc > 7 ? argv[7] : NULL);
+	}
+	if (strcmp(argv[1], "txn-rmxattr") == 0 && argc > 4) {
+		return cmd_txn_rmxattr(argv[2], argv[3], argv[4], argc > 5 ? argv[5] : NULL);
+	}
+	if (strcmp(argv[1], "spaceman") == 0) {
+		return cmd_spaceman(argv[2], argc > 3 && strcmp(argv[3], "--chunks") == 0);
 	}
 	if (strcmp(argv[1], "writable") == 0) {
 		return cmd_writable(argv[2]);

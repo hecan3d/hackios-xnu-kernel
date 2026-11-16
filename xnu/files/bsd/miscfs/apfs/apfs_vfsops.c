@@ -158,11 +158,54 @@ apfs_dev_read_data(void *ctx, uint64_t off, void *buf, size_t len)
  * the device, past the cache, and is waited for: a commit's blocks have to arrive in the
  * order it writes them.
  */
+/* (what writing costs, for kern.apfs_stats: one count per request the device is given) */
+static uint64_t apfs_wr_calls, apfs_wr_bytes, apfs_wr_ticks;
+
+/*
+ * Who gives the device its writes.  The per-process table of the mount is filled by the vnops, and
+ * p409 showed it empty while the device took 371 716 writes (2.3 GB, 294 s) -- either those writes
+ * are not made by a vnop of this mount at all or the accounting never runs.  This one is here, at
+ * the device, where the number is certainly counted: the process name of whoever is writing, and
+ * how much time the device took for it.
+ */
+#define APFS_WR_WHO 24
+static struct {
+	char     name[MAXCOMLEN + 1];
+	uint64_t calls, ticks, bytes;
+} apfs_wr_who[APFS_WR_WHO];
+
+static void
+apfs_wr_note(uint64_t ticks, size_t bytes)
+{
+	char name[MAXCOMLEN + 1];
+	unsigned i;
+
+	proc_selfname(name, sizeof(name));
+	for (i = 0; i < APFS_WR_WHO; i++) {
+		if (apfs_wr_who[i].name[0] != 0 && strncmp(apfs_wr_who[i].name, name, sizeof(name)) == 0) {
+			os_atomic_inc(&apfs_wr_who[i].calls, relaxed);
+			os_atomic_add(&apfs_wr_who[i].ticks, ticks, relaxed);
+			os_atomic_add(&apfs_wr_who[i].bytes, (uint64_t)bytes, relaxed);
+			return;
+		}
+		if (apfs_wr_who[i].name[0] == 0) {
+			strlcpy(apfs_wr_who[i].name, name, sizeof(apfs_wr_who[i].name));
+			os_atomic_inc(&apfs_wr_who[i].calls, relaxed);
+			os_atomic_add(&apfs_wr_who[i].ticks, ticks, relaxed);
+			os_atomic_add(&apfs_wr_who[i].bytes, (uint64_t)bytes, relaxed);
+			return;
+		}
+	}
+}
+
 static int
 apfs_dev_write(void *ctx, uint64_t off, const void *buf, size_t len)
 {
 	struct apfs_devctx *dc = ctx;
 	const char *in = buf;
+	size_t total = len;
+	uint64_t t0 = apfs_ticks();
+	int error = 0;
 
 	off += dc->dc_base;
 	if ((off % dc->dc_devblock) != 0 || (len % dc->dc_devblock) != 0) {
@@ -171,6 +214,7 @@ apfs_dev_write(void *ctx, uint64_t off, const void *buf, size_t len)
 	while (len > 0) {
 		size_t n = len < APFS_DATA_MAX ? len : APFS_DATA_MAX;
 		buf_t bp = buf_alloc(dc->dc_devvp);
+		uint64_t wrote_at = apfs_ticks();
 		int error;
 
 		if (bp == NULL) {
@@ -201,8 +245,12 @@ apfs_dev_write(void *ctx, uint64_t off, const void *buf, size_t len)
 		in += n;
 		off += n;
 		len -= n;
+		apfs_wr_calls++;
+		apfs_wr_note(apfs_ticks() - wrote_at, n);
 	}
-	return 0;
+	apfs_wr_bytes += (uint64_t)total;
+	apfs_wr_ticks += apfs_ticks() - t0;
+	return error;
 }
 
 /* ------------------------------------------------------------- where the time goes */
@@ -282,6 +330,10 @@ apfs_ticks_ms(uint64_t ticks)
 #define APFS_WD_SLOW_NS     (5ULL * NSEC_PER_SEC)
 #define APFS_WD_NAMED       8
 
+/* How long an operation may last before the watchdog writes it down (boot-arg apfs_wd_ms,
+ * 5000 by default; a run that has to see the slow ones asks for 200). */
+uint64_t apfs_wd_slow_ns = APFS_WD_SLOW_NS;
+
 static uint64_t
 apfs_ns_to_ticks(uint64_t ns)
 {
@@ -309,7 +361,7 @@ apfs_watchdog_call(void *p0, void *p1)
 
 	(void)p1;
 	now = apfs_ticks();
-	slow = apfs_ns_to_ticks(APFS_WD_SLOW_NS);
+	slow = apfs_ns_to_ticks(apfs_wd_slow_ns);
 	wlock_name[0] = 0;
 	if (am->am_ops != NULL && lck_mtx_try_lock(&am->am_lock)) {
 		for (i = 0; i < am->am_nops && n < APFS_WD_NAMED; i++) {
@@ -399,6 +451,24 @@ apfs_lock_report(struct apfs_mount *am, char *buf, size_t len)
 	size_t at = strlen(buf);
 	uint32_t i;
 
+	/* (first: the report is cut off at len, and the per-process lines alone are half of it) */
+	{
+		unsigned shown = 0;
+
+		at += scnprintf(buf + at, len - at, "writes by who (requests the device was given, and the time it took):");
+		for (i = 0; i < APFS_WR_WHO && apfs_wr_who[i].name[0] != 0 && at < len; i++) {
+			if (shown >= 8) {
+				break;
+			}
+			shown++;
+			at += scnprintf(buf + at, len - at, " %s %llu req %llu ms %llu MB%s", apfs_wr_who[i].name,
+			    (unsigned long long)apfs_wr_who[i].calls,
+			    (unsigned long long)apfs_ticks_ms(apfs_wr_who[i].ticks),
+			    (unsigned long long)(apfs_wr_who[i].bytes >> 20), i + 1 < APFS_WR_WHO ? "," : "\n");
+		}
+		at += scnprintf(buf + at, len - at, "\n");
+	}
+
 	at += scnprintf(buf + at, len - at, "lookups  %llu of names not there, now in the name cache as such; %llu "
 	    "answered by it so\n", am->am_lookup_negative, am->am_lookup_negative_hits);
 	at += scnprintf(buf + at, len - at, "inactive %llu with nothing to give back, without the lock\n",
@@ -454,18 +524,23 @@ apfs_lock_report(struct apfs_mount *am, char *buf, size_t len)
 	}
 	for (i = 0; am->am_procs != NULL && i < APFS_LOCK_PROCS && i < am->am_nprocs && at < len; i++) {
 		const struct apfs_lock_proc *lp = &am->am_procs[i];
-		uint64_t wmax;
+		uint64_t wmax, wwmax;
 
-		/* (only who waited 1 ms or more in all, or read 1 MB or more) */
-		if (apfs_ticks_ms(lp->wait) == 0 && lp->read_bytes + lp->pagein_bytes < (1 << 20)) {
+		/* (only who waited 1 ms or more in all, or read 1 MB or more, or wrote for a second) */
+		if (apfs_ticks_ms(lp->wait) == 0 && lp->read_bytes + lp->pagein_bytes < (1 << 20) &&
+		    apfs_ticks_ms(lp->write_held + lp->write_wait) == 0) {
 			continue;
 		}
 		absolutetime_to_nanoseconds(lp->wait_max, &wmax);
+		absolutetime_to_nanoseconds(lp->write_wait_max, &wwmax);
 		at += scnprintf(buf + at, len - at, "who      %-16.16s waited %6llu times over 10 us, %6llu ms (longest %7llu us, "
-		    "%4llu over 1 ms); read(2) %6llu calls %10llu bytes %6llu ms; pagein %6llu calls %10llu bytes %6llu ms\n",
+		    "%4llu over 1 ms); read(2) %6llu calls %10llu bytes %6llu ms; pagein %6llu calls %10llu bytes %6llu ms; "
+		    "wrote %6llu epochs %6llu ms (longest wait %6llu us), waited %6llu ms\n",
 		    lp->name, lp->waits, (unsigned long long)apfs_ticks_ms(lp->wait), wmax / 1000, lp->wait_long,
 		    lp->read_calls, lp->read_bytes, (unsigned long long)apfs_ticks_ms(lp->read_ticks), lp->pagein_calls,
-		    lp->pagein_bytes, (unsigned long long)apfs_ticks_ms(lp->pagein_ticks));
+		    lp->pagein_bytes, (unsigned long long)apfs_ticks_ms(lp->pagein_ticks), lp->write_epochs,
+		    (unsigned long long)apfs_ticks_ms(lp->write_held), wwmax / 1000,
+		    (unsigned long long)apfs_ticks_ms(lp->write_wait));
 	}
 }
 
@@ -475,6 +550,11 @@ apfs_lock_report(struct apfs_mount *am, char *buf, size_t len)
  * waiting for the device, the time spent decompressing, and the rest -- which is the
  * driver's own work and the paging machinery above it.
  */
+/* the kernel's own page counts: what decides how much the paging machinery asks a fault for */
+extern unsigned int vm_page_free_count, vm_page_free_target, vm_page_throttle_limit;
+extern unsigned int vm_page_speculative_count, vm_page_inactive_count, vm_page_active_count;
+extern unsigned int vm_page_wire_count;
+
 static int
 sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 {
@@ -497,8 +577,14 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 		    "pagein   %llu calls  %llu ms  %llu bytes\n"
 		    "read     %llu calls  %llu ms  %llu bytes; from the page cache %llu, read into it %llu (%s)\n"
 		    "device   %llu calls  %llu ms  %llu bytes\n"
+		    "writes   %llu calls  %llu ms  %llu bytes\n"
 		    "data     %llu calls  %llu ms  %llu bytes\n"
 		    "inflate  %llu calls  %llu ms  %llu bytes in  %llu bytes out  %llu by zlib\n"
+		    "batch    %llu requests  %llu pieces  %u threads at most\n"
+		    "ahead    %llu times  %llu pieces  %llu of them used\n"
+		    "pra      %u KB a window, %llu windows filled, %llu bytes\n"
+		    "pagein   sizes: %llu up to 32 KB, %llu to 64 KB, %llu to 128 KB, %llu to 256 KB, %llu bigger\n"
+		    "vm       free %u (target %u, throttle %u) speculative %u, inactive %u, active %u, wired %u\n"
 		    "blocks   %llu read  %llu cache hits\n"
 		    "lookups  %llu by the name's hash  %llu by reading the directory\n"
 		    "lock     %llu takes  %llu ms waiting  %llu ms held; metadata read without it %llu times\n",
@@ -515,6 +601,9 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 		    (unsigned long long)nx->dev_calls,
 		    (unsigned long long)apfs_ticks_ms(nx->dev_ticks),
 		    (unsigned long long)nx->dev_bytes,
+		    (unsigned long long)apfs_wr_calls,
+		    (unsigned long long)apfs_ticks_ms(apfs_wr_ticks),
+		    (unsigned long long)apfs_wr_bytes,
 		    (unsigned long long)nx->data_calls,
 		    (unsigned long long)apfs_ticks_ms(nx->data_ticks),
 		    (unsigned long long)nx->data_bytes,
@@ -523,6 +612,23 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 		    (unsigned long long)nx->inflate_in,
 		    (unsigned long long)nx->inflate_out,
 		    (unsigned long long)nx->inflate_fallbacks,
+		    (unsigned long long)nx->batch_calls,
+		    (unsigned long long)nx->batch_pieces,
+		    nx->parallel != NULL ? nx->parallel_max : 1,
+		    (unsigned long long)nx->ra_batches,
+		    (unsigned long long)nx->ra_pieces,
+		    (unsigned long long)nx->ra_hits,
+		    (unsigned)(am->am_pra / 1024),
+		    (unsigned long long)am->am_pra_calls,
+		    (unsigned long long)am->am_pra_bytes,
+		    (unsigned long long)am->am_pagein_size[0],
+		    (unsigned long long)am->am_pagein_size[1],
+		    (unsigned long long)am->am_pagein_size[2],
+		    (unsigned long long)am->am_pagein_size[3],
+		    (unsigned long long)am->am_pagein_size[4],
+		    vm_page_free_count, vm_page_free_target, vm_page_throttle_limit,
+		    vm_page_speculative_count, vm_page_inactive_count, vm_page_active_count,
+		    vm_page_wire_count,
 		    (unsigned long long)nx->reads,
 		    (unsigned long long)nx->hits,
 		    (unsigned long long)nx->lookups_hashed,
@@ -543,10 +649,16 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 		am->am_pagein_calls = am->am_pagein_ticks = am->am_pagein_bytes = 0;
 		am->am_read_calls = am->am_read_ticks = am->am_read_bytes = 0;
 		am->am_nx.dev_calls = am->am_nx.dev_ticks = am->am_nx.dev_bytes = 0;
+		apfs_wr_calls = apfs_wr_bytes = apfs_wr_ticks = 0;
 		am->am_nx.data_calls = am->am_nx.data_ticks = am->am_nx.data_bytes = 0;
 		am->am_nx.inflate_calls = am->am_nx.inflate_ticks = 0;
 		am->am_nx.inflate_in = am->am_nx.inflate_out = am->am_nx.inflate_fallbacks = 0;
 		am->am_nx.reads = am->am_nx.hits = 0;
+		am->am_nx.batch_calls = am->am_nx.batch_pieces = 0;
+		am->am_nx.ra_batches = am->am_nx.ra_pieces = am->am_nx.ra_hits = 0;
+		am->am_pra_calls = 0;
+		am->am_pra_bytes = 0;
+		memset(am->am_pagein_size, 0, sizeof(am->am_pagein_size));
 		am->am_lock_waits = am->am_lock_wait_ticks = am->am_lock_held_ticks = 0;
 		memset(am->am_lock_wait_hist, 0, sizeof(am->am_lock_wait_hist));
 		am->am_lock_wait_max = 0;
@@ -1239,6 +1351,20 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint64_t base,
 	(void)VNOP_IOCTL(devvp, DKIOCGETBLOCKCOUNT, (caddr_t)&devblocks, 0, ctx);
 	apfs_klog("apfs_mount_common: devblock=%u devblocks=%llu base=%llu container=%u volume=%d\n",
 	    devblock, (unsigned long long)devblocks, (unsigned long long)base, container, volume);
+	/* where memory stands before the volume is in use: how much of it was wired away by the boot */
+	{
+		extern unsigned int vm_page_free_count, vm_page_wire_count, vm_page_active_count;
+		extern unsigned int vm_page_inactive_count, vm_page_speculative_count;
+		extern unsigned int vm_page_pageable_external_count, vm_page_pageable_internal_count;
+
+		apfs_klog("apfs: memory at mount: free %u MB, files %u MB, programs %u MB, wired %u MB; "
+		    "active %u, inactive %u, speculative %u pages\n",
+		    (unsigned)((uint64_t)vm_page_free_count * PAGE_SIZE >> 20),
+		    (unsigned)((uint64_t)vm_page_pageable_external_count * PAGE_SIZE >> 20),
+		    (unsigned)((uint64_t)vm_page_pageable_internal_count * PAGE_SIZE >> 20),
+		    (unsigned)((uint64_t)vm_page_wire_count * PAGE_SIZE >> 20),
+		    vm_page_active_count, vm_page_inactive_count, vm_page_speculative_count);
+	}
 
 	am = kalloc_type(struct apfs_mount, Z_WAITOK | Z_ZERO);
 	if (am == NULL) {
@@ -1253,6 +1379,34 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint64_t base,
 
 		(void)PE_parse_boot_argn("apfs_ubc_read", &ubc, sizeof(ubc));
 		am->am_ubc_read = (ubc != 0);
+	}
+	{
+		/*
+		 * Read-ahead for pagein, in KB (0: off).  The paging machinery asks 32 KB at a
+		 * time, so a file read through comes a thousand faults, and a reader going
+		 * forward is given the pieces after the one it asked for (see apfs_pagein_ahead).
+		 */
+		uint32_t pra = 0;
+
+		(void)PE_parse_boot_argn("apfs_pra", &pra, sizeof(pra));
+		am->am_pra = MIN(pra, 1024u) * 1024u;
+		if (am->am_pra != 0) {
+			apfs_klog("apfs: pagein reads ahead %u KB for a reader going forward (apfs_pra)\n",
+			    (unsigned)(am->am_pra / 1024));
+		}
+	}
+	{
+		/* how slow an operation has to be for the watchdog to write it down (apfs_wd_ms) */
+		uint32_t wd_ms = 5000;
+
+		(void)PE_parse_boot_argn("apfs_wd_ms", &wd_ms, sizeof(wd_ms));
+		if (wd_ms < 50) {
+			wd_ms = 50;
+		}
+		apfs_wd_slow_ns = (uint64_t)wd_ms * 1000000ULL;
+		if (wd_ms != 5000) {
+			apfs_klog("apfs: operations over %u ms are written down (apfs_wd_ms)\n", wd_ms);
+		}
 	}
 	am->am_procs = kalloc_data(APFS_LOCK_PROCS * sizeof(am->am_procs[0]), Z_WAITOK | Z_ZERO);
 	am->am_ops = kalloc_data(APFS_OPS_MAX * sizeof(am->am_ops[0]), Z_WAITOK | Z_ZERO);
@@ -1335,6 +1489,16 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint64_t base,
 	}
 
 	error = apfs_nx_open(&am->am_nx, &dev);
+	if (error == 0) {
+		/* (after the container is open: that is where its own fields are made) */
+		uint32_t verify = 1;
+
+		(void)PE_parse_boot_argn("apfs_verify", &verify, sizeof(verify));
+		am->am_nx.write_verify = (verify != 0);
+		if (!am->am_nx.write_verify) {
+			apfs_klog("apfs: the blocks of a commit are not read back (apfs_verify=0)\n");
+		}
+	}
 	if (error) {
 		apfs_klog("apfs_mount_common: apfs_nx_open returned %d\n", error);
 		if (error != EINVAL) {
@@ -1501,6 +1665,34 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint64_t base,
 	lck_mtx_lock(&apfs_pool_lock);
 	am->am_next = apfs_mounts;
 	apfs_mounts = am;
+	/*
+	 * The volume group: the biggest container of the volumes mounted here, the writable one
+	 * preferred -- the data volume.  A read-only volume of the group reports that container's
+	 * size and free space (apfs_vfs_getattr), as "/" does on an iPhone, where the system and
+	 * the data volume are two volumes of one container.  Here they are two containers, and in
+	 * a RAM boot they are not even on one device (the system image is md0), hence no test on
+	 * the device: whatever the volumes share is the space iOS can put applications in.
+	 */
+	{
+		struct apfs_mount *m, *big = NULL;
+
+		for (m = apfs_mounts; m != NULL; m = m->am_next) {
+			if (!vfs_isrdonly(m->am_mp) &&
+			    (big == NULL || m->am_nx.block_count > big->am_nx.block_count)) {
+				big = m;
+			}
+		}
+		if (big == NULL) {
+			for (m = apfs_mounts; m != NULL; m = m->am_next) {
+				if (big == NULL || m->am_nx.block_count > big->am_nx.block_count) {
+					big = m;
+				}
+			}
+		}
+		for (m = apfs_mounts; m != NULL; m = m->am_next) {
+			m->am_group = big;
+		}
+	}
 	lck_mtx_unlock(&apfs_pool_lock);
 	if (writable) {
 		printf("apfs: volume %u mounted read-write, %llu MB free\n", am->am_vol.index,
@@ -1677,6 +1869,12 @@ apfs_unmount(mount_t mp, int mntflags, vfs_context_t ctx)
 			break;
 		}
 	}
+	/* (the group it was in: whatever is left of it reports its own size again) */
+	for (struct apfs_mount *m = apfs_mounts; m != NULL; m = m->am_next) {
+		if (m->am_group == am) {
+			m->am_group = m;
+		}
+	}
 	lck_mtx_unlock(&apfs_pool_lock);
 	vfs_setfsprivate(mp, NULL);
 	if (am->am_owns_devvp && am->am_devvp != NULLVP) {
@@ -1719,6 +1917,8 @@ apfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 	 */
 	{
 		uint64_t free_blocks = 0;
+		uint64_t blocks = am->am_nx.block_count;
+		uint64_t used = am->am_vol.alloc_count;
 
 		if (!vfs_isrdonly(mp)) {
 			struct apfs_spaceman sm;
@@ -1730,14 +1930,46 @@ apfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 			}
 			apfs_unlock(am);
 		}
+		/*
+		 * The volume group (am_group, set at mount): on an iPhone the system and the data
+		 * volume are two volumes of one container, and "/" reports that container's size and
+		 * free space.  Here they are two containers of one device; without this, iOS took the
+		 * 2.5 GB of the system image for the whole of "iPhone Storage" -- 3 GB with 2.6 used --
+		 * and zero free, which is "Storage Full" on a device with fifty gigabytes free.  The
+		 * group's own space manager is read here, under its lock; a read-only volume holds
+		 * nothing that it then asks for.
+		 */
+		if (am->am_group != NULL && am->am_group != am) {
+			struct apfs_mount *g = am->am_group;
+			struct apfs_spaceman sm;
+
+			blocks = g->am_nx.block_count;
+			used = g->am_vol.alloc_count;
+			apfs_lock(g);
+			if (apfs_spaceman_open(&g->am_nx, &sm) == 0) {
+				free_blocks = sm.free_count;
+				apfs_spaceman_close(&sm);
+			}
+			apfs_unlock(g);
+		}
 		VFSATTR_RETURN(fsap, f_bsize, am->am_nx.block_size);
 		VFSATTR_RETURN(fsap, f_iosize, am->am_nx.block_size);
-		VFSATTR_RETURN(fsap, f_blocks, am->am_nx.block_count);
+		VFSATTR_RETURN(fsap, f_blocks, blocks);
 		VFSATTR_RETURN(fsap, f_bfree, free_blocks);
 		VFSATTR_RETURN(fsap, f_bavail, free_blocks);
-		VFSATTR_RETURN(fsap, f_bused, am->am_vol.alloc_count);
+		VFSATTR_RETURN(fsap, f_bused, used);
 		VFSATTR_RETURN(fsap, f_files, files);
 		VFSATTR_RETURN(fsap, f_ffree, free_blocks);
+		/* (kept in the mount's own statfs too: df and statfs(2) read that, not this) */
+		{
+			struct vfsstatfs *sp = vfs_statfs(mp);
+
+			if (sp != NULL) {
+				sp->f_blocks = blocks;
+				sp->f_bfree = free_blocks;
+				sp->f_bavail = free_blocks;
+			}
+		}
 	}
 
 	if (VFSATTR_IS_ACTIVE(fsap, f_capabilities)) {

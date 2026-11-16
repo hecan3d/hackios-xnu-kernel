@@ -68,4 +68,42 @@ static inline mode_t getmode(const void *set, mode_t omode) { (void)omode; retur
 #ifndef EFTYPE
 #define EFTYPE EINVAL
 #endif
+
+/* glibc before 2.38 has no strlcpy/strlcat; XNU's SETUP tools use them */
+#if !defined(__GLIBC__) || !defined(__GLIBC_PREREQ)
+#define XNU_HOST_NO_GLIBC_PREREQ 1
+#elif !__GLIBC_PREREQ(2, 38)
+#define XNU_HOST_NO_GLIBC_PREREQ 1
+#endif
+#ifdef XNU_HOST_NO_GLIBC_PREREQ
+static inline size_t
+host_strlcpy(char *dst, const char *src, size_t size)
+{
+	size_t n = strlen(src);
+	if (size != 0) {
+		size_t c = n < size - 1 ? n : size - 1;
+		memcpy(dst, src, c);
+		dst[c] = 0;
+	}
+	return n;
+}
+static inline size_t
+host_strlcat(char *dst, const char *src, size_t size)
+{
+	size_t d = strnlen(dst, size);
+	size_t n = strlen(src);
+	if (d == size) {
+		return size + n;
+	}
+	if (n < size - d - 1) {
+		memcpy(dst + d, src, n + 1);
+	} else {
+		memcpy(dst + d, src, size - d - 1);
+		dst[size - 1] = 0;
+	}
+	return d + n;
+}
+#define strlcpy host_strlcpy
+#define strlcat host_strlcat
+#endif
 #endif

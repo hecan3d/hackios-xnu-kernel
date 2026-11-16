@@ -12,9 +12,16 @@ ROOT=$(cd "$HERE/../.." && pwd)
 OUT=${1:-$ROOT/apfs-work/apfs-tool}
 
 SRC=""
-for d in "$ROOT/xnu-src/xnu-8796.121.2/bsd/miscfs/apfs" "$ROOT/xnu/files/bsd/miscfs/apfs"; do
-	[ -f "$d/apfs_lib.c" ] && { SRC=$d; break; }
-done
+# XNU_SRC names the tree under test (as xnu-build.sh takes it): the phone's own tree, when the
+# work is there and the base tree has not caught up.
+if [ -n "${XNU_SRC:-}" ] && [ -f "$XNU_SRC/bsd/miscfs/apfs/apfs_lib.c" ]; then
+	SRC=$XNU_SRC/bsd/miscfs/apfs
+fi
+if [ -z "$SRC" ]; then
+	for d in "$ROOT/xnu-src/xnu-8796.121.2/bsd/miscfs/apfs" "$ROOT/xnu/files/bsd/miscfs/apfs"; do
+		[ -f "$d/apfs_lib.c" ] && { SRC=$d; break; }
+	done
+fi
 [ -n "$SRC" ] || { echo "build-tool.sh: apfs_lib.c is in neither the kernel tree nor xnu/files" >&2; exit 1; }
 
 mkdir -p "$(dirname "$OUT")"
@@ -40,6 +47,6 @@ else
 	echo "build-tool.sh: no bsd/vfs/vfs_unicode.c: names other than plain ASCII are found by reading the directory" >&2
 fi
 cc -std=c11 -D_DEFAULT_SOURCE -O2 -Wall -Wextra -Wno-unused-parameter -I"$SRC" -I"$HERE" \
-	$TOOL_CFLAGS -o "$OUT" "$HERE/apfs-tool.c" "$SRC/apfs_lib.c" "$SRC/apfs_write.c" "$SRC/apfs_store.c" "$SRC/apfs_zbitmap.c" \
+	$TOOL_CFLAGS -o "$OUT" "$HERE/apfs-tool.c" "$SRC/apfs_lib.c" "$SRC/apfs_write.c" "$SRC/apfs_txn.c" "$SRC/apfs_btree_write.c" "$SRC/apfs_fs_write.c" "$SRC/apfs_store.c" "$SRC/apfs_zbitmap.c" \
 	"$OBJ/apfs_deflate.o" $UNI -lz -lcrypto -pthread
 echo "build-tool.sh: $OUT (from $SRC)"

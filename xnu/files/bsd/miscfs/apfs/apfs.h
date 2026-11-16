@@ -82,6 +82,13 @@ struct apfs_mount {
 	bool               am_shares_devvp; /* another container of a device one of ours has open: not opened again */
 	dev_t              am_rdev;         /* the device, for those other containers to find (apfs_mounts) */
 	struct apfs_mount *am_next;         /* in apfs_mounts */
+	/*
+	 * The volume group: the mount of the same device whose container is the largest -- the
+	 * data volume, here -- so that a read-only volume reports the group's size and free space
+	 * the way "/" does on an iPhone, where System and Data are two volumes of one container.
+	 * NULL: none; the volume reports its own.
+	 */
+	struct apfs_mount *am_group;
 	struct apfs_node  *am_hash[APFS_HASH_BUCKETS];
 	uint64_t           am_root_id;
 	/*
@@ -160,10 +167,17 @@ struct apfs_mount {
 		uint64_t   waits, wait, wait_max, wait_long;
 		uint64_t   read_calls, read_bytes, pagein_calls, pagein_bytes;
 		uint64_t   read_ticks, pagein_ticks;     /* time in them, added without the lock (atomic) */
+		/* what the writing costs this process: epochs held, the time in them, and the waits for the mutex */
+		uint64_t   write_epochs, write_held, write_wait, write_wait_max;
 	}                 *am_procs;
 	uint32_t           am_nprocs;
 	lck_spin_t         am_procs_spin;   /* finding or adding an entry (a read from the page cache has no am_lock) */
 	bool               am_ubc_read;     /* read(2) through the page cache (boot-arg apfs_ubc_read, default 1) */
+	uint32_t           am_pra;          /* pagein read-ahead bytes (boot-arg apfs_pra, KB; 0: none) */
+	uint32_t           am_pra_calls;    /* windows it filled */
+	uint64_t           am_pra_bytes;    /* and how many bytes they were */
+	/* pagein calls by the size the paging machinery asked for: 32 KB or less, 64, 128, 256, more */
+	uint64_t           am_pagein_size[5];
 	uint32_t           am_nops;
 	uint32_t           am_untracked;    /* operations the table had no room for: nothing is freed meanwhile */
 	void              *am_wd_call;      /* thread_call_t: the watchdog that names what does not return */
@@ -225,6 +239,9 @@ struct apfs_node {
 	/* read(2) through the page cache: where a reader in order would read next, and how much it was given ahead (hints, atomic) */
 	uint64_t           an_read_next;
 	uint32_t           an_read_window;
+	/* pagein read-ahead: where the next fault would be if this reader went on, and how much it was given last time (atomic) */
+	uint64_t           an_pra_next;
+	uint32_t           an_pra_window;
 };
 
 struct apfs_link {
@@ -253,6 +270,9 @@ void apfs_lock_at(struct apfs_mount *am, const char *site);  /* an operation beg
 #define apfs_lock(am) apfs_lock_at((am), __func__)
 void apfs_unlock(struct apfs_mount *am);         /* and ends */
 void apfs_unlock_inner(struct apfs_mount *am);   /* let go of in the middle of one */
+
+/* operations longer than this are written down as they end (boot-arg apfs_wd_ms, 5 s by default) */
+extern uint64_t apfs_wd_slow_ns;
 
 /* the watchdog that names the operations and the writer's mutex that do not come back */
 void apfs_watchdog_begin(struct apfs_mount *am);

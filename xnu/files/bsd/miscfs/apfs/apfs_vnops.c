@@ -307,6 +307,24 @@ apfs_unlock(struct apfs_mount *am)
 
 	for (i = 0; i < am->am_nops; i++) {
 		if (!found && am->am_ops[i].th == self) {
+			struct apfs_op *op = &am->am_ops[i];
+			uint64_t age = apfs_ticks() - op->start;
+
+			/*
+			 * An operation that took long is written down as it ends: the watchdog above
+			 * looks every ten seconds and misses most of them, while a commit of a cache
+			 * file holds the writer's mutex for hundreds of milliseconds and everything
+			 * else writes waits for it.
+			 */
+			if (age > 0 && apfs_wd_slow_ns != 0) {
+				uint64_t ns = 0;
+
+				absolutetime_to_nanoseconds(age, &ns);
+				if (ns >= apfs_wd_slow_ns) {
+					apfs_log("op %s by %s took %llu ms\n", op->site, op->name,
+					    (unsigned long long)(ns / 1000000));
+				}
+			}
 			am->am_ops[i] = am->am_ops[--am->am_nops];
 			found = true;
 			if (i == am->am_nops) {
@@ -454,13 +472,37 @@ static void
 apfs_lock_write(struct apfs_mount *am)
 {
 	thread_t self = current_thread();
+	uint64_t t0;
 
 	if (am->am_wlock_depth != 0 && am->am_wlock_owner == self) {
 		am->am_wlock_depth++;
 		apfs_lock(am);
 		return;
 	}
+	t0 = apfs_ticks();
 	lck_mtx_lock(&am->am_wlock);
+	/*
+	 * The writer's mutex is held across a whole operation -- a transaction, its commit, the
+	 * blocks on their way to the flash -- so every other writer waits for the longest one.
+	 * A wait of a quarter of a second is written down with the name of the process that had
+	 * it: p392 had SpringBoard's unlink() wait 4.1 s, and this says who it waited for.
+	 */
+	{
+		uint64_t waited = apfs_ticks() - t0, ns = 0;
+		struct apfs_lock_proc *lp = lock_proc(am);
+
+		absolutetime_to_nanoseconds(waited, &ns);
+		if (ns >= 250000000ULL) {
+			apfs_log("write waited %llu ms for the writer's mutex (the one before: %s)\n",
+			    (unsigned long long)(ns / 1000000),
+			    am->am_wlock_name[0] != 0 ? am->am_wlock_name : "?");
+		}
+		/* what each process pays for the writing: this wait, and the epoch it then holds */
+		os_atomic_add(&lp->write_wait, waited, relaxed);
+		if (waited > lp->write_wait_max) {
+			os_atomic_store(&lp->write_wait_max, waited, relaxed);
+		}
+	}
 	am->am_wlock_owner = self;
 	am->am_wlock_depth = 1;
 	am->am_wlock_since = apfs_ticks();
@@ -473,9 +515,14 @@ apfs_unlock_write(struct apfs_mount *am)
 {
 	apfs_unlock(am);
 	if (--am->am_wlock_depth == 0) {
+		/* how long this process held the writer's mutex: the transaction, its commit, the blocks */
+		struct apfs_lock_proc *lp = lock_proc(am);
+
+		os_atomic_inc(&lp->write_epochs, relaxed);
+		os_atomic_add(&lp->write_held, apfs_ticks() - am->am_wlock_since, relaxed);
 		am->am_wlock_owner = NULL;
 		am->am_wlock_since = 0;
-		am->am_wlock_name[0] = 0;
+		/* (the name stays: a writer that waits for it says whose it was) */
 		lck_mtx_unlock(&am->am_wlock);
 	}
 }
@@ -1554,6 +1601,100 @@ apfs_vnop_pageout(struct vnop_pageout_args *ap)
  * compressed file has no block mapping at all, and a plain one is read out of the extents
  * just as cheaply here.
  */
+#define APFS_PRA_MAX    (1024 * 1024)
+
+/*
+ * Reading ahead for pagein.  The paging machinery asks 32 KB at a time, so a file read
+ * through comes a thousand faults -- each its own UPL, its own turn at the lock, and its
+ * own 64 KB piece decompressed on one processor (a request of one piece leaves the helper
+ * threads nothing to take).  A reader going forward is given the pages after the one it
+ * asked for, filled into the page cache the way cluster_read does it, so that the faults
+ * that follow find theirs there and never come down here.  What it is given doubles each
+ * time it comes to the end of it, up to a megabyte; a fault anywhere else starts it over at
+ * the boot-arg's size (apfs_pra, KB; 0: none).
+ *
+ * Off by default, and it stays off: p380, with 256 KB, read ahead 1 664 MB where the run
+ * faulted in 640 MB -- pages put in as UPL_COMMIT_INACTIVATE are the first to go, so the
+ * same window was filled again and again, and the decompression under the lock grew 2.3
+ * times (14 050 pieces to 30 052; pagein 3 962 ms to 5 100, lock waits 3 489 to 7 574).
+ * The volume has ~800 MB for file pages (2.5 GB of the 4.2 GB are the system image held in
+ * RAM), which is less than what the daemons touch: prefetching into it only pushes out what
+ * is about to be asked for.  What the same runs say is worth having: the paging machinery's
+ * own cluster (32 to 256 KB, from vm_object_cluster_size) and the decompression are the
+ * cost, not the device (646 MB of data reads in 135 ms, 21 MB from the device in 35 ms).
+ */
+static void
+apfs_pagein_ahead(struct apfs_mount *am, vnode_t vp, struct apfs_inode *ino,
+    uint64_t size, off_t at)
+{
+	struct apfs_node *an = APFS_VP(vp);
+	upl_t upl = NULL;
+	upl_page_info_t *pl = NULL;
+	vm_offset_t address = 0;
+	uint64_t filled = 0;
+	off_t end;
+	uint32_t window, prev, npages, i;
+	int upl_size, error = 0;
+
+	if (am->am_pra == 0 || size == 0 || at < 0 || (uint64_t)at >= size ||
+	    !UBCINFOEXISTS(vp) || !an->an_cf.compressed) {
+		return;                 /* (a plain file comes out of the block cache: nothing to save) */
+	}
+	at = (off_t)((uint64_t)at & ~(uint64_t)PAGE_MASK_64);
+	prev = os_atomic_load(&an->an_pra_window, relaxed);
+	if (prev > (uint32_t)APFS_PRA_MAX / 2) {
+		prev = (uint32_t)APFS_PRA_MAX / 2;
+	}
+	if ((uint64_t)at == os_atomic_load(&an->an_pra_next, relaxed)) {
+		window = MAX(prev * 2, am->am_pra);
+	} else {
+		window = am->am_pra;
+	}
+	os_atomic_store(&an->an_pra_window, window, relaxed);
+	end = (off_t)((uint64_t)at + window);
+	if ((uint64_t)end > size) {
+		end = (off_t)(size & ~(uint64_t)PAGE_MASK_64);
+	}
+	if (end <= at) {
+		return;
+	}
+	upl_size = (int)(end - at);
+	if (ubc_create_upl_kernel(vp, at, upl_size, &upl, &pl, UPL_SET_LITE,
+	    VM_KERN_MEMORY_FILE) != KERN_SUCCESS || upl == NULL) {
+		return;
+	}
+	if (ubc_upl_map(upl, &address) != KERN_SUCCESS || address == 0) {
+		ubc_upl_abort_range(upl, 0, (upl_size_t)upl_size, UPL_ABORT_FREE_ON_EMPTY);
+		return;
+	}
+	npages = (uint32_t)(upl_size / PAGE_SIZE);
+	for (i = 0; i < npages && error == 0;) {
+		uint32_t j;
+
+		if (upl_valid_page(pl, i)) {
+			i++;            /* (somebody read it meanwhile: not read again) */
+			continue;
+		}
+		for (j = i + 1; j < npages && !upl_valid_page(pl, j); j++) {
+		}
+		error = apfs_fill(am, vp, ino, size, at + (off_t)i * PAGE_SIZE,
+		    (uint8_t *)address + (size_t)i * PAGE_SIZE, (size_t)(j - i) * PAGE_SIZE,
+		    &filled);
+		i = j;
+	}
+	(void)ubc_upl_unmap(upl);
+	if (error) {
+		ubc_upl_abort_range(upl, 0, (upl_size_t)upl_size, UPL_ABORT_FREE_ON_EMPTY);
+		os_atomic_store(&an->an_pra_next, 0, relaxed);  /* (nothing to go on from) */
+		return;
+	}
+	ubc_upl_commit_range(upl, 0, (upl_size_t)upl_size, UPL_COMMIT_FREE_ON_EMPTY |
+	    UPL_COMMIT_INACTIVATE | UPL_COMMIT_CLEAR_DIRTY | UPL_COMMIT_WRITTEN_BY_KERNEL);
+	os_atomic_store(&an->an_pra_next, (uint64_t)end, relaxed);
+	os_atomic_inc(&am->am_pra_calls, relaxed);
+	os_atomic_add(&am->am_pra_bytes, (uint64_t)upl_size, relaxed);
+}
+
 static int
 apfs_vnop_pagein(struct vnop_pagein_args *ap)
 {
@@ -1650,6 +1791,10 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 	os_atomic_add(&am->am_pagein_ticks, apfs_ticks() - t0, relaxed);
 	os_atomic_inc(&am->am_pagein_calls, relaxed);
 	os_atomic_add(&am->am_pagein_bytes, (uint64_t)ap->a_size, relaxed);
+	/* (what the paging machinery asked for: the VM gives less under memory pressure -- 512 KB / 16) */
+	os_atomic_inc(&am->am_pagein_size[ap->a_size <= 2 * PAGE_SIZE ? 0 :
+	    (ap->a_size <= 4 * PAGE_SIZE ? 1 : (ap->a_size <= 8 * PAGE_SIZE ? 2 :
+	    (ap->a_size <= 16 * PAGE_SIZE ? 3 : 4)))], relaxed);
 	if (!(ap->a_flags & UPL_NOCOMMIT)) {
 		if (error) {
 			ubc_upl_abort_range(upl, upl_offset, (upl_size_t)ap->a_size,
@@ -1658,6 +1803,10 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 			ubc_upl_commit_range(upl, upl_offset, (upl_size_t)ap->a_size,
 			    UPL_COMMIT_CLEAR_DIRTY | UPL_COMMIT_FREE_ON_EMPTY);
 		}
+	}
+	/* (after this fault's own pages: what a reader going on would ask for next) */
+	if (error == 0) {
+		apfs_pagein_ahead(am, vp, &ino, size, offset + (off_t)ap->a_size);
 	}
 	return error;
 }

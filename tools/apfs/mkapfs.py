@@ -65,7 +65,10 @@ DECMPFS_ZLIB_ATTR, DECMPFS_ZLIB_RSRC = 3, 4
 XATTR_MAX_EMBEDDED = 3804               # the most an attribute's value can hold in its record
 PIECE = 65536
 
-SM_BITMAP_XID_OFF = 0x150               # (apfsprogs' mkapfs: from a test image)
+# The versioned space manager: the structure ends with sm_struct_size and the allocation-zone
+# records, and the arrays begin after them (macOS 12's fsck refuses their old place at 0x150).
+SM_STRUCT_SIZE = 344 + 2176
+SM_BITMAP_XID_OFF = SM_STRUCT_SIZE
 IP_BM_TX_MULTIPLIER = 16
 IP_BM_INDEX_INVALID = 0xffff
 
@@ -727,7 +730,9 @@ class Container:
             struct.pack_into('<HHIIIHH', sb, 0x60, 5, 0, 0, 6, 0, 1, 0)   # meta crypto: v5.0, class F, revision 1
             struct.pack_into('<III', sb, 0x74, VIRTUAL | T_BTREE, PHYSICAL | T_BTREE, PHYSICAL | T_BTREE)
             struct.pack_into('<QQQQ', sb, 0x80, v.omap_bno, v.fs_oids[0], v.er_addrs[0], v.snap_bno)
-            struct.pack_into('<Q', sb, 0xb0, v.next_oid)
+            # the tree's nodes are oids too, and they come out of the container's
+            # counter: the volume's next object id has to be above every one of them
+            struct.pack_into('<Q', sb, 0xb0, max(v.next_oid, self.next_oid))
             struct.pack_into('<QQQQQ', sb, 0xb8, v.counts['files'], v.counts['dirs'], v.counts['symlinks'], 0, 0)
             struct.pack_into('<QQ', sb, 0xe0, alloc, 0)
             sb[0xf0:0x100] = self.uuid('volume %d' % v.index)
@@ -808,12 +813,17 @@ class Container:
         struct.pack_into('<IIII', sm, 32, BS, bpc, self.chunks_per_cib, self.cibs_per_cab)
         struct.pack_into('<QQIIQIIQ', sm, 48, bc, self.chunks, self.cibs, self.cabs, free_total,
                          self.cib_addr_off, 0, 0)
-        struct.pack_into('<IIQIIQQQQ', sm, 144, 0, IP_BM_TX_MULTIPLIER, self.ip_blocks, self.ip_bm_size,
+        struct.pack_into('<IIQIIQQQQ', sm, 144, 1, IP_BM_TX_MULTIPLIER, self.ip_blocks, self.ip_bm_size,
                          self.ip_bmap_blocks, self.ip_bm_base, self.ip_base, 0, 0)
         struct.pack_into('<QQQHHIQ', sm, 200, 0, self.ipfq_oid, 0, ip_fq_node_limit(self.chunks), 0, 0, 0)
         struct.pack_into('<QQQHHIQ', sm, 240, 0, self.mainfq_oid, 0, main_fq_node_limit(bc), 0, 0, 0)
         struct.pack_into('<HHIII', sm, 320, self.ip_bm_size, self.ip_bmap_blocks - 1, SM_BITMAP_XID_OFF,
                          self.bm_addr_off, self.bm_free_next_off)
+        struct.pack_into('<II', sm, 336, 1, SM_STRUCT_SIZE)      # sm_version, sm_struct_size
+        # The second device (tier2 of a Fusion set) is empty, but its array offset is checked
+        # all the same: 0 would be inside the structure.
+        struct.pack_into('<I', sm, 96 + 32,
+            self.cib_addr_off + 8 * (self.cabs if self.cabs > 1 else self.cibs))
         for i in range(self.ip_bm_size):
             struct.pack_into('<Q', sm, SM_BITMAP_XID_OFF + 8 * i, XID)
             struct.pack_into('<H', sm, self.bm_addr_off + 2 * i, i)

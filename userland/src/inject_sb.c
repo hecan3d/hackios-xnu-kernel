@@ -78,6 +78,7 @@ extern void xpc_connection_resume(xpc_connection_t_sb connection);
 #include <unistd.h>
 #include <signal.h>
 #include <sys/ucontext.h>
+#include <sys/mman.h>
 
 /* where what is said goes: the standard error, which is the console's for SpringBoard (an application's is nowhere) */
 static int say_fd = 2;
@@ -107,6 +108,26 @@ extern const void *_dyld_get_shared_cache_range(size_t *length);
 static uintptr_t slide;
 #include "collection_safety.h"
 
+/* The names of what a trap came through: unslid addresses are what the log prints, dladdr wants the
+ * ones the process is running at.  A "signal 5" in SpringBoard (p402: 27 times in a row, while a
+ * ScreenTime widget extension was being launched) says nothing until its frames have names. */
+static void
+say_fault_near(const char *what, uintptr_t address)
+{
+	Dl_info info;
+
+	if (address == 0 || dladdr((void *)address, &info) == 0) {
+		return;
+	}
+	if (info.dli_sname != NULL) {
+		say("hakios: fault   %s near %s+%lu\n", what, info.dli_sname,
+		    (unsigned long)(address - (uintptr_t)info.dli_saddr));
+	} else if (info.dli_fname != NULL) {
+		say("hakios: fault   %s in %s+%#lx\n", what, info.dli_fname,
+		    (unsigned long)(address - (uintptr_t)info.dli_fbase));
+	}
+}
+
 static void
 say_the_fault(int signal_number, siginfo_t *info, void *context_in)
 {
@@ -121,6 +142,9 @@ say_the_fault(int signal_number, siginfo_t *info, void *context_in)
 	size_t used = 0;
 	uintptr_t fp = context != NULL && context->uc_mcontext != NULL ? (uintptr_t)context->uc_mcontext->__ss.__fp : 0;
 
+	uintptr_t frame_addresses[8];
+	unsigned frame_count = 0;
+
 	for (unsigned i = 0; i < 8 && fp != 0 && (fp & 7) == 0; i++) {
 		uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
 
@@ -128,11 +152,17 @@ say_the_fault(int signal_number, siginfo_t *info, void *context_in)
 			break;
 		}
 		used += (size_t)snprintf(frames + used, sizeof(frames) - used, " %#lx", ret - slide);
+		frame_addresses[frame_count++] = ret;
 		fp = next > fp ? next : 0;
 	}
 	say("hakios: %s[%d]: signal %d at %p, pc %#lx, lr %#lx, called from%s (unslid)\n",
 	    getprogname(), getpid(), signal_number,
 	    info != NULL ? info->si_addr : NULL, pc - slide, lr - slide, frames);
+	say_fault_near("pc", pc);
+	say_fault_near("lr", lr);
+	for (unsigned i = 0; i < frame_count; i++) {
+		say_fault_near("from", frame_addresses[i]);
+	}
 	signal(signal_number, SIG_DFL);
 	raise(signal_number);
 }
@@ -211,6 +241,9 @@ hakios_exception_handler(id exception)
 #define CA_COMMIT_ORDER 2000000
 static uint64_t main_woke, commit_began;
 static mach_timebase_info_data_t timebase;
+static int turns_logged = 1;            /* the "tl: a" line per turn (touch_lat=1; stall_lat=1 leaves it out) */
+static thread_t main_thread_port;       /* the main thread, for the watchdog (watch_main_loop) */
+static volatile int stuck_level;        /* how far into the turn the last sample was taken: 1 = 250 ms, 2 = 1 s, 3 = 4 s */
 
 static uint64_t
 now_us(void)
@@ -226,22 +259,76 @@ main_loop_turn(__unused CFRunLoopObserverRef observer, CFRunLoopActivity activit
 	} else if (activity == kCFRunLoopBeforeWaiting && info == NULL) {
 		commit_began = now_us();
 	} else if (activity == kCFRunLoopBeforeWaiting && main_woke != 0) {
-		say("tl: a %llu %llu %llu\n", main_woke, commit_began, now_us());
+		if (turns_logged) {
+			say("tl: a %llu %llu %llu\n", main_woke, commit_began, now_us());
+		}
 		main_woke = 0;
 	}
 }
+
+/* The watchdog's thread: a turn of the main run loop that lasts says nothing about what it waits
+ * for, so the main thread is sampled while it lasts, once at each of 250 ms, 1 s and 4 s. */
+static void sample_one(unsigned index, thread_t thread);
+static void sample_threads(int seconds);
+
+static void *
+main_stuck_watch(void *unused)
+{
+	(void)unused;
+	for (;;) {
+		uint64_t woke, ms;
+		int level;
+
+		usleep(100000);
+		woke = main_woke;
+		if (woke == 0 || main_thread_port == MACH_PORT_NULL) {
+			stuck_level = 0;
+			continue;
+		}
+		ms = (now_us() - woke) / 1000;
+		level = ms >= 4000 ? 3 : (ms >= 1000 ? 2 : (ms >= 250 ? 1 : 0));
+		if (level > stuck_level) {
+			stuck_level = level;
+			say("hakios: stuck %llu ms in one turn of the main run loop\n", (unsigned long long)ms);
+			sample_one(0, main_thread_port);
+			/*
+			 * A second in __psynch_mutexwait says the main thread waits for a lock, and nothing
+			 * about who holds it: on the seconds-long ones every other thread is sampled too, so
+			 * the holder's stack is in the log next to the waiter's.
+			 */
+			if (level >= 2) {
+				say("hakios: the other threads, while the main one waits\n");
+				sample_threads((int)(ms / 1000));
+			}
+		}
+	}
+	return NULL;
+}
+
 
 static void
 watch_main_loop(void)
 {
 	char args[1024] = "";
 	size_t size = sizeof(args) - 1;
-	const char *arg;
+	const char *lat, *stall;
 
-	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || (arg = strstr(args, "touch_lat=1")) == NULL ||
-	    (arg != args && arg[-1] != ' ')) {
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0) {
 		return;
 	}
+	/*
+	 * touch_lat=1 writes a line for every turn and every frame; on a 1 MB kernel ring that is
+	 * minutes of log and nothing else.  stall_lat=1 keeps the watchdog and leaves those two lines
+	 * out, so the whole run stays in the ring and is read after it -- the stalls are rare, and
+	 * they are what is wanted when the screen is the user's own swiping.
+	 */
+	lat = strstr(args, "touch_lat=1");
+	stall = strstr(args, "stall_lat=1");
+	if ((lat == NULL || (lat != args && lat[-1] != ' ')) &&
+	    (stall == NULL || (stall != args && stall[-1] != ' '))) {
+		return;
+	}
+	turns_logged = lat != NULL && (lat == args || lat[-1] == ' ');
 	mach_timebase_info(&timebase);
 	CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopAfterWaiting, true, LONG_MIN,
 	    main_loop_turn, NULL), kCFRunLoopCommonModes);
@@ -252,6 +339,21 @@ watch_main_loop(void)
 
 		CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopBeforeWaiting, true,
 		    CA_COMMIT_ORDER + 1, main_loop_turn, &after), kCFRunLoopCommonModes);
+	}
+	/*
+	 * And the watchdog that says where the main thread is while such a turn lasts: a turn of
+	 * 11 s (p389) says the window server drew nothing, and nothing about the call that held it.
+	 * From a thread of its own, at 250 ms into a turn, again at 1 s and at 4 s, the main
+	 * thread's stack is written down -- "hakios: stuck N ms" then the "Sample t0" lines.
+	 */
+	main_thread_port = pthread_mach_thread_np(pthread_self());
+	{
+		pthread_t watchdog;
+
+		if (pthread_create(&watchdog, NULL, main_stuck_watch, NULL) == 0) {
+			pthread_detach(watchdog);
+			say("hakios: the main thread's stalls are watched (250 ms, 1 s, 4 s)\n");
+		}
 	}
 }
 
@@ -1493,6 +1595,22 @@ image_of(uintptr_t address, uintptr_t *offset)
 	return NULL;
 }
 
+/*
+ * The nearest exported name at or before an address: dladdr reads the image's dynamic symbols, so a
+ * private function of a framework shows up as the public one it lies after, with the distance --
+ * enough to say "the wallpapers' code" or "CoreGraphics' image source" from a bare offset.
+ */
+static void
+say_near(unsigned index, const char *what, uintptr_t address)
+{
+	Dl_info info;
+
+	if (address != 0 && dladdr((void *)address, &info) != 0 && info.dli_sname != NULL) {
+		say("hakios: Sample t%u   %s near %s+%lu\n", index, what, info.dli_sname,
+		    (unsigned long)(address - (uintptr_t)info.dli_saddr));
+	}
+}
+
 static void
 sample_one(unsigned index, thread_t thread)
 {
@@ -1521,10 +1639,12 @@ sample_one(unsigned index, thread_t thread)
 		say("hakios: Sample t%u run %d pc %#lx\n", index, run_state,
 		    (unsigned long)arm_thread_state64_get_pc(state));
 	}
+	say_near(index, "pc", (uintptr_t)arm_thread_state64_get_pc(state));
 	image = image_of((uintptr_t)arm_thread_state64_get_lr(state), &offset);
 	if (image != NULL) {
 		say("hakios: Sample t%u   lr %s+%#lx\n", index, image, (unsigned long)offset);
 	}
+	say_near(index, "lr", (uintptr_t)arm_thread_state64_get_lr(state));
 	for (frame = 0; frame < 8 && fp != 0 && (fp & 7) == 0; frame++) {
 		struct { uintptr_t next, ret; } pair;
 		vm_size_t got = 0;
@@ -1540,6 +1660,7 @@ sample_one(unsigned index, thread_t thread)
 		if (image != NULL) {
 			say("hakios: Sample t%u   from %s+%#lx\n", index, image, (unsigned long)offset);
 		}
+		say_near(index, "from", pair.ret);
 		if (pair.next <= fp) {
 			break;
 		}
@@ -2650,6 +2771,240 @@ watched_from_endpoint(xpc_object_t_sb endpoint)
 }
 
 HAKIOS_INTERPOSE(watched_from_endpoint, xpc_connection_create_from_endpoint);
+
+
+/* ---- the images SpringBoard decodes for the home screen --------------------------------------- */
+
+/*
+ * The home screen's jank is not the panel: p399 measured 60 fps while a finger dragged, and then a
+ * stall of 4 s with the stack ending in CGDataProviderRetainBytePtr inside QuartzCore -- the image
+ * decode, whose stack does not name the file.  Under touch_lat=1 these say the path of every image
+ * SpringBoard opens, how long the decode took when it was slow, and where a provider sat when the
+ * bytes were actually wanted.
+ */
+static char image_file[256];
+static unsigned image_lines;
+
+/* (declared here: this library names ImageIO's functions without including its headers) */
+extern void *CGImageSourceCreateWithURL(CFURLRef, CFDictionaryRef);
+extern void *CGImageSourceCreateImageAtIndex(void *, size_t, CFDictionaryRef);
+
+static int
+image_log_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+
+		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 &&
+		    (strstr(args, "touch_lat=1") != NULL || strstr(args, "stall_lat=1") != NULL);
+	}
+	return on;
+}
+
+static uint64_t
+image_ms(void)
+{
+	static mach_timebase_info_data_t tb;
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	return mach_absolute_time() * tb.numer / tb.denom / 1000000;
+}
+
+static void
+image_note_file(CFURLRef url)
+{
+	CFStringRef path;
+	char buffer[sizeof(image_file)] = "";
+
+	if (url == NULL) {
+		return;
+	}
+	path = CFURLCopyFileSystemPath(url, kCFURLPOSIXPathStyle);
+	if (path != NULL) {
+		CFStringGetCString(path, buffer, sizeof(buffer), kCFStringEncodingUTF8);
+		CFRelease(path);
+	}
+	if (buffer[0] != 0) {
+		strlcpy(image_file, buffer, sizeof(image_file));
+	}
+}
+
+static void *
+timed_image_source_url(CFURLRef url, CFDictionaryRef options)
+{
+	void *source;
+
+	if (image_log_on()) {
+		image_note_file(url);
+	}
+	/* (the real one: a call by name from this image is not interposed; a stored pointer would be
+	 *  NULL, and jumping through it is what killed SpringBoard 27 times in p402) */
+	source = CGImageSourceCreateWithURL(url, options);
+	if (image_log_on() && image_lines < 40) {
+		image_lines++;
+		say("hakios: image source %s %s\n", image_file[0] != 0 ? image_file : "?",
+		    source != NULL ? "opened" : "refused");
+	}
+	return source;
+}
+
+static void *
+timed_image_source_image(void *source, size_t index, CFDictionaryRef options)
+{
+	uint64_t t0 = image_ms();
+	void *image = CGImageSourceCreateImageAtIndex(source, index, options);
+	uint64_t ms = image_ms() - t0;
+
+	if (image_log_on() && image_lines < 400) {
+		image_lines++;
+		if (ms >= 10) {
+			say("hakios: image %s[%zu] decoded in %llu ms\n",
+			    image_file[0] != 0 ? image_file : "?", index, (unsigned long long)ms);
+		}
+	}
+	return image;
+}
+
+static const void *
+timed_provider_bytes(void *provider)
+{
+	uint64_t t0 = image_ms();
+	const void *bytes = orig_provider_bytes(provider);
+	uint64_t ms = image_ms() - t0;
+
+	if (ms >= 50 && image_log_on() && image_lines < 400) {
+		image_lines++;
+		say("hakios: image %s: the bytes took %llu ms\n",
+		    image_file[0] != 0 ? image_file : "?", (unsigned long long)ms);
+	}
+	return bytes;
+}
+
+HAKIOS_INTERPOSE(timed_image_source_url, CGImageSourceCreateWithURL);
+HAKIOS_INTERPOSE(timed_image_source_image, CGImageSourceCreateImageAtIndex);
+
+/* The wallpaper is not opened through ImageIO: p406's stall runs CGContextDrawImageWithOptions ->
+ * CGAccessSessionCreate -> CGDataProviderRetainBytePtr, which is a data provider made from a URL
+ * or a file name.  These two name it. */
+extern void *CGDataProviderCreateWithURL(CFURLRef);
+extern void *CGDataProviderCreateWithFilename(const char *);
+
+static void *
+timed_provider_url(CFURLRef url)
+{
+	void *provider;
+
+	if (image_log_on()) {
+		image_note_file(url);
+	}
+	provider = CGDataProviderCreateWithURL(url);
+	if (image_log_on() && image_lines < 40) {
+		image_lines++;
+		say("hakios: provider %s %s\n", image_file[0] != 0 ? image_file : "?",
+		    provider != NULL ? "opened" : "refused");
+	}
+	return provider;
+}
+
+static void *
+timed_provider_filename(const char *filename)
+{
+	uint64_t t0 = image_ms();
+	void *provider = CGDataProviderCreateWithFilename(filename);
+	uint64_t ms = image_ms() - t0;
+
+	if (ms >= 50 && image_log_on() && image_lines < 400) {
+		image_lines++;
+		say("hakios: provider %s in %llu ms\n", filename != NULL ? filename : "?",
+		    (unsigned long long)ms);
+	}
+	return provider;
+}
+
+HAKIOS_INTERPOSE(timed_provider_url, CGDataProviderCreateWithURL);
+HAKIOS_INTERPOSE(timed_provider_filename, CGDataProviderCreateWithFilename);
+
+/* The stack of a stall (p408) ends in CGContextDrawImageWithOptions -> CGAccessSessionCreate ->
+ * CGDataProviderRetainBytePtr: the provider's bytes are wanted, and the decode happens there.  The
+ * two ways SpringBoard makes an image out of a provider are these; the time they take is the stall. */
+extern void *CGImageCreateWithPNGDataProvider(void *provider, const void *decode, bool interpolate, int intent);
+extern void *CGImageCreateWithJPEGDataProvider(void *provider, const void *decode, bool interpolate, int intent);
+extern size_t CGImageGetWidth(void *image);
+extern size_t CGImageGetHeight(void *image);
+
+static void *
+timed_png_image(void *provider, const void *decode, bool interpolate, int intent)
+{
+	uint64_t t0 = image_ms();
+	void *image = CGImageCreateWithPNGDataProvider(provider, decode, interpolate, intent);
+	uint64_t ms = image_ms() - t0;
+
+	if (image_log_on()) {
+		say("hakios: png image %s %zux%zu in %llu ms\n", image_file[0] != 0 ? image_file : "?",
+		    image != NULL ? CGImageGetWidth(image) : 0, image != NULL ? CGImageGetHeight(image) : 0,
+		    (unsigned long long)ms);
+	}
+	return image;
+}
+
+static void *
+timed_jpeg_image(void *provider, const void *decode, bool interpolate, int intent)
+{
+	uint64_t t0 = image_ms();
+	void *image = CGImageCreateWithJPEGDataProvider(provider, decode, interpolate, intent);
+	uint64_t ms = image_ms() - t0;
+
+	if (image_log_on()) {
+		say("hakios: jpeg image %s %zux%zu in %llu ms\n", image_file[0] != 0 ? image_file : "?",
+		    image != NULL ? CGImageGetWidth(image) : 0, image != NULL ? CGImageGetHeight(image) : 0,
+		    (unsigned long long)ms);
+	}
+	return image;
+}
+
+HAKIOS_INTERPOSE(timed_png_image, CGImageCreateWithPNGDataProvider);
+HAKIOS_INTERPOSE(timed_jpeg_image, CGImageCreateWithJPEGDataProvider);
+
+
+/* ---- a mapping that takes its time ------------------------------------------------------------ */
+
+/*
+ * p404 sampled SpringBoard's main thread four seconds into a turn and found it in __mmap, called
+ * from AppSupport by SpringBoardUIServices -- the wallpaper's image.  mmap on this port is where
+ * the file's pages are made, and nothing in the stack says which file.  Under stall_lat=1 (or
+ * touch_lat=1) a mapping of a file that took longer than 100 ms is written down with its path.
+ */
+static void *
+timed_mmap(void *address, size_t length, int prot, int flags, int fd, off_t offset)
+{
+	uint64_t t0, ms;
+	void *result;
+
+	if (!image_log_on() || fd < 0) {
+		return mmap(address, length, prot, flags, fd, offset);
+	}
+	t0 = image_ms();
+	result = mmap(address, length, prot, flags, fd, offset);
+	ms = image_ms() - t0;
+	if (ms >= 100 && image_lines < 400) {
+		char path[256] = "";
+
+		image_lines++;
+		if (fcntl(fd, F_GETPATH, path) != 0) {
+			path[0] = 0;
+		}
+		say("hakios: mmap %s %llu ms (%zu bytes, flags %#x)\n", path[0] != 0 ? path : "?",
+		    (unsigned long long)ms, length, (unsigned)flags);
+	}
+	return result;
+}
+
+HAKIOS_INTERPOSE(timed_mmap, mmap);
 
 
 /* ---- a wait that never ends, made to end ------------------------------------------------------ */

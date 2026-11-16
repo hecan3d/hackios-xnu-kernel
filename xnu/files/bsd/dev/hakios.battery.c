@@ -87,10 +87,11 @@ battery_snapshot(struct loader_battery *out)
 	return false;
 }
 
+static void battery_share(const struct loader_battery *s);
+
 static void
 battery_poll(void)
-{
-	struct loader_battery sample;
+{	struct loader_battery sample;
 
 	if (!battery_snapshot(&sample) || sample.magic != LOADER_BATTERY_MAGIC ||
 	    sample.version != LOADER_BATTERY_VERSION || sample.size < sizeof(sample) ||
@@ -108,6 +109,7 @@ battery_poll(void)
 	battery_soc_estimated = (sample.flags & LOADER_BATTERY_SOC_ESTIMATED) != 0;
 	battery_charger_action = (int)sample.charger_action;
 	battery_updates++;
+	battery_share(&sample);
 }
 
 /*
@@ -116,6 +118,7 @@ battery_poll(void)
  * and passed on to the power source that iOS reads (iokit/Kernel/hakios.battery.cpp).
  */
 static int battery_full_uah, battery_design_uah, battery_cycles, battery_source_dsp;
+static int battery_source_loader;
 
 SYSCTL_INT(_kern_hakios, OID_AUTO, battery_full_uah, CTLFLAG_RD | CTLFLAG_LOCKED,
     &battery_full_uah, 0, "the battery's full charge as the fuel gauge has learnt it, in uAh (0 if unknown)");
@@ -125,8 +128,40 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, battery_cycles, CTLFLAG_RD | CTLFLAG_LOCKED,
     &battery_cycles, 0, "the battery's charge cycles (0 if unknown)");
 SYSCTL_INT(_kern_hakios, OID_AUTO, battery_from_dsp, CTLFLAG_RD | CTLFLAG_LOCKED,
     &battery_source_dsp, 0, "1 when the values come from the audio DSP's battery manager");
+SYSCTL_INT(_kern_hakios, OID_AUTO, battery_from_loader, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &battery_source_loader, 0, "1 when the values come from xnuloader's charger cache");
 
 extern void HakiosBatteryReport(const void *state, unsigned size);     /* iokit/Kernel/hakios.battery.cpp */
+
+/*
+ * The power source iOS reads (iokit/Kernel/hakios.battery.cpp), fed from xnuloader's charger cache.
+ * On this phone the audio DSP's battery manager never comes up (the DSP hangs in survey, p352), so
+ * without this there is no battery in iOS at all: no percentage in the status bar, no "Charging".
+ * The loader's numbers are the firmware's own (its charger driver and fuel gauge), read-only here.
+ */
+static void
+battery_share(const struct loader_battery *s)
+{
+	struct hakios_battery_state b;
+
+	b.size = sizeof(b);
+	b.percent_hundredths = s->soc_percent * 100;
+	b.voltage_uv = (s->flags & LOADER_BATTERY_VOLTAGE_VALID) ? s->voltage_mv * 1000 : 0;
+	b.current_ua = s->current_ma * 1000;
+	b.temperature_hundredths = s->temperature_c * 100;
+	b.present = (s->flags & LOADER_BATTERY_PRESENT) != 0;
+	b.external = (s->flags & LOADER_BATTERY_CHARGER_PRESENT) != 0;
+	b.status = (s->flags & LOADER_BATTERY_CHARGING) ? 1 : (s->soc_percent >= 100 ? 4 : 2);
+	b.charge_uah = 0;
+	b.full_uah = 0;
+	b.design_uah = 0;
+	b.cycles = 0;
+	b.usb_type = 0;
+	b.usb_voltage_uv = 0;
+	b.usb_current_ua = 0;
+	battery_source_loader = 1;
+	HakiosBatteryReport(&b, sizeof(b));
+}
 
 void
 hakios_battery_report(const struct hakios_battery_state *b)

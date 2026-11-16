@@ -788,45 +788,75 @@ txn_finish_spaceman(struct apfs_txn *txn)
 
 /*
  * All of it goes out in the order it was staged -- the structures a reader would follow
- * first, the commit last -- and every block is read back and compared before the next one.
+ * first, the commit last.  The blocks that lie next to each other in the order staged go out
+ * as one request, up to APFS_WRITE_GROUP of them: one transfer of the loader's block service
+ * costs some 400 us whatever its length, so a snapshot of 3 MB was 750 transfers, and a
+ * transaction of a commit's blocks held the writer's mutex for a second and more (p393:
+ * SpringBoard waited 0.3 to 1.1 s for logd, assetsd and SpringBoard itself).  The read back
+ * and compare is one per group as well, and boot-arg apfs_verify=0 leaves it out (the loader
+ * does not verify its own writes either).
  */
+#define APFS_WRITE_GROUP    32          /* blocks in one request: 128 KB */
+
 static int
 txn_write_all(struct apfs_txn *txn)
 {
 	struct apfs_nx *nx = txn->nx;
 	uint32_t bs = nx->block_size;
-	uint8_t *back = apfs_alloc(bs);
+	uint8_t *group = apfs_alloc((size_t)APFS_WRITE_GROUP * bs);
 	uint32_t i;
 	int error = 0;
 
-	if (back == NULL) {
+	if (group == NULL) {
 		return ENOMEM;
 	}
-	for (i = 0; i < txn->npend; i++) {
+	for (i = 0; i < txn->npend && error == 0;) {
 		uint64_t at = txn->pend[i].addr * (uint64_t)bs;
+		uint32_t n = 1, k;
 
-		error = nx->dev.write(nx->dev.ctx, at, txn->pend[i].data, bs);
+		while (i + n < txn->npend && n < APFS_WRITE_GROUP &&
+		    txn->pend[i + n].addr == txn->pend[i].addr + n) {
+			n++;
+		}
+		if (n == 1) {
+			error = nx->dev.write(nx->dev.ctx, at, txn->pend[i].data, bs);
+		} else {
+			for (k = 0; k < n; k++) {
+				memcpy(group + (size_t)k * bs, txn->pend[i + k].data, bs);
+			}
+			error = nx->dev.write(nx->dev.ctx, at, group, (size_t)n * bs);
+		}
 		if (error) {
 			apfs_log("block %llu: the device refused the write: %d\n",
 			    (unsigned long long)txn->pend[i].addr, error);
 			break;
 		}
-		if (nx->dev.read_data != NULL) {
-			error = nx->dev.read_data(nx->dev.ctx, at, back, bs);
-		} else {
-			error = nx->dev.read(nx->dev.ctx, at, back, bs);
+		if (nx->write_verify) {
+			uint8_t *where = apfs_alloc((size_t)n * bs);
+
+			if (where == NULL) {
+				error = ENOMEM;
+				break;
+			}
+			if (nx->dev.read_data != NULL) {
+				error = nx->dev.read_data(nx->dev.ctx, at, where, (size_t)n * bs);
+			} else {
+				error = nx->dev.read(nx->dev.ctx, at, where, (size_t)n * bs);
+			}
+			if (error == 0 &&
+			    memcmp(where, n == 1 ? txn->pend[i].data : group, (size_t)n * bs) != 0) {
+				apfs_log("block %llu read back as something else than it was written\n",
+				    (unsigned long long)txn->pend[i].addr);
+				error = EIO;
+			}
+			apfs_free(where, (size_t)n * bs);
+			if (error) {
+				break;
+			}
 		}
-		if (error) {
-			break;
-		}
-		if (memcmp(back, txn->pend[i].data, bs) != 0) {
-			apfs_log("block %llu read back as something else than it was written\n",
-			    (unsigned long long)txn->pend[i].addr);
-			error = EIO;
-			break;
-		}
+		i += n;
 	}
-	apfs_free(back, bs);
+	apfs_free(group, (size_t)APFS_WRITE_GROUP * bs);
 	return error;
 }
 

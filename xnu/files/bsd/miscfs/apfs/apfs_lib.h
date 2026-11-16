@@ -248,6 +248,14 @@ struct apfs_nx {
 	 * ramdisk, from its flash it saved 52.9 -> 46.3 s over the root volume.
 	 */
 	bool              cheap_requests;
+	/*
+	 * Whether a commit's blocks are read back and compared after they are written (boot-arg
+	 * apfs_verify, default 1).  A write of the loader's block service costs some 400 us
+	 * whatever its length, so the read back cost as much as the write did: with it off, a
+	 * commit is half the requests (p393: the writer's mutex was held 0.3 to 1.1 s at a time).
+	 */
+	bool              write_verify;
+	uint64_t          wr_calls, wr_bytes, wr_ticks;   /* the device's writes: requests, bytes, time */
 	uint64_t          prefetched, prefetch_used;   /* neighbours brought in, and later asked for */
 	uint64_t          reads;
 	uint64_t          hits;

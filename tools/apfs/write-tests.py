@@ -145,11 +145,34 @@ def all_agree(image, path, want):
                               for n in bad)
 
 
+def sparse_agree(image, path, want):
+    """Two readers agree about a file with holes in it.  7-Zip is left out: it does not read
+    APFS holes as zeros, so a sparse file is not something it can judge."""
+    py = read_py_bytes(image, path)
+    p = subprocess.run([TOOL, 'cat', image, path], stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT)
+    bad = []
+    if py != want:
+        bad.append('apfs.py')
+    if p.returncode != 0 or p.stdout != want:
+        bad.append('apfs-tool')
+    return not bad, ', '.join(bad)
+
+
 def census(image):
     """Every entry of the volume with a hash of its contents, by the Python reader: the
     witness that no other file was touched."""
     rc, out = run(sys.executable, os.path.join(HERE, 'verify.py'), 'clines', image)
     return out if rc == 0 else None
+
+
+def read_ls(image, path='/'):
+    """apfs.py's listing of one directory: the names, as a reader that is not this code sees
+    them (None if the path cannot be read at all)."""
+    rc, out = run(sys.executable, os.path.join(HERE, 'apfs.py'), 'ls', image, path)
+    if rc != 0:
+        return None
+    return sorted(line.split()[-1] for line in out.splitlines() if line.strip())
 
 
 # ---------------------------------------------------------------- which blocks changed
@@ -610,6 +633,185 @@ def test_writes():
     do_write('w-cross', '/two', BS - 3, b'\xee' * 6)
 
 
+def txn(*argv, **kw):
+    """One command of apfs-tool: the kernel's own volume operations, committed as a checkpoint."""
+    p = subprocess.run([TOOL] + list(argv), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kw)
+    return p.returncode, p.stdout.decode('utf-8', 'replace')
+
+
+def test_names():
+    """A file made, written, renamed and cut short: four transactions of the file-system tree,
+    each judged by the readers that are not this code and by apfsck."""
+    base, img = fresh('names')
+    data = bytes((i * 7 + 3) & 0xff for i in range(3 * BS))
+    good = True
+
+    rc, out = txn('txn-create', img, '/', 't.bin')
+    good = say(rc == 0, 'create /t.bin' + ('' if rc == 0 else ':\n' + out.strip())) and good
+    rc, out = txn('txn-append', img, '/t.bin', '-', '1700000000000000000',
+                  input=data)
+    good = say(rc == 0, 'append %d bytes to /t.bin' % len(data) +
+               ('' if rc == 0 else ':\n' + out.strip())) and good
+    agree, bad = all_agree(img, '/t.bin', data)
+    good = say(agree, '  every reader reads the bytes back' + ('' if agree else ': ' + bad)) and good
+    ok, ck = read_apfsck(img)
+    good = say(ok, '  apfsck finds the container clean' + ('' if ok else ':\n' + ck)) and good
+
+    rc, out = txn('txn-rename', img, '/', 't.bin', '/sub', 'renamed')
+    good = say(rc == 0, 'rename /t.bin -> /sub/renamed' +
+               ('' if rc == 0 else ':\n' + out.strip())) and good
+    agree, bad = all_agree(img, '/sub/renamed', data)
+    good = say(agree, '  every reader reads it under the new name' +
+               ('' if agree else ': ' + bad)) and good
+    gone = read_py_bytes(img, '/t.bin') is None and txn('stat', img, '/t.bin')[0] != 0
+    good = say(gone, '  and the old name is gone, by both readers') and good
+    ok, ck = read_apfsck(img)
+    good = say(ok, '  apfsck finds the container clean' + ('' if ok else ':\n' + ck)) and good
+
+    rc, out = txn('txn-truncate', img, '/sub/renamed', str(5000))
+    good = say(rc == 0, 'truncate /sub/renamed to 5000 bytes' +
+               ('' if rc == 0 else ':\n' + out.strip())) and good
+    agree, bad = all_agree(img, '/sub/renamed', data[:5000])
+    good = say(agree, '  every reader reads the first 5000 bytes' +
+               ('' if agree else ': ' + bad)) and good
+    ok, ck = read_apfsck(img)
+    good = say(ok, '  apfsck finds the container clean' + ('' if ok else ':\n' + ck)) and good
+
+    rc, out = txn('txn-truncate', img, '/sub/renamed', '0')
+    good = say(rc == 0, 'truncate it to nothing' +
+               ('' if rc == 0 else ':\n' + out.strip())) and good
+    agree, bad = all_agree(img, '/sub/renamed', b'')
+    good = say(agree, '  every reader reads an empty file' +
+               ('' if agree else ': ' + bad)) and good
+    ok, ck = read_apfsck(img)
+    good = say(ok, '  apfsck finds the container clean' + ('' if ok else ':\n' + ck)) and good
+
+    moved = [l for l in (census(img) or '').splitlines()
+             if l not in (census(base) or '').splitlines()]
+    good = say(len(moved) == 1 and 'sub/renamed' in moved[0],
+               '  and of the whole volume only /sub/renamed is new') and good
+
+    # the refusals: a name that is taken, and a "truncate" that would grow a file
+    rc, out = txn('txn-rename', img, '/sub', 'renamed', '/', 'one')
+    good = say(rc != 0 and 'File exists' in out, 'refused: a rename onto a name that is taken') \
+        and good
+    rc, out = txn('txn-truncate', img, '/sub/renamed', str(4096))
+    good = say(rc == 0, 'grow an empty file to 4096 bytes' +
+               ('' if rc == 0 else ':\n' + out.strip())) and good
+    agree, bad = sparse_agree(img, '/sub/renamed', bytes(4096))
+    good = say(agree, '  the new bytes read as zeros' +
+               ('' if agree else ': ' + bad)) and good
+    ok, ck = read_apfsck(img)
+    say(ok, 'apfsck still finds the container clean' + ('' if ok else ':\n' + ck))
+
+
+def test_empty():
+    """A directory filled past what one leaf holds, and then emptied again.  Two things meet
+    here: the fill splits the tree -- new nodes, new identifiers, new keys in the node above --
+    and the emptying leaves nodes with nothing in them, which have to be deleted rather than
+    written empty ("empty children should just be deleted", says apfsck) and whose records have
+    to leave the object map with them."""
+    base, img = fresh('empty')
+    names = ['f-%d' % i for i in range(1, 49)]
+    keep = ['text']                     # the file the image starts with, left alone throughout
+    good = True
+
+    rc, out = txn('txn-create-many', img, '/sub', *names)
+    good = say(rc == 0, 'create %d files in /sub, more than one leaf holds' % len(names) +
+               ('' if rc == 0 else ':\n' + out.strip())) and good
+    listed = read_ls(img, '/sub')
+    good = say(listed == sorted(names + keep),
+               '  every one of them is in the directory' if listed == sorted(names + keep) else
+               '  the directory holds %d of them: %s' % (len(listed or []), listed)) and good
+    ok, ck = read_apfsck(img)
+    good = say(ok, '  apfsck finds the container clean after the splits' +
+               ('' if ok else ':\n' + ck)) and good
+
+    gone = 0
+    for name in names:
+        rc, out = txn('txn-unlink', img, '/sub', name)
+        if rc != 0:
+            good = say(False, '  unlink /sub/%s: %s' % (name, out.strip())) and good
+            break
+        gone += 1
+    good = say(gone == len(names), 'unlink all %d of them, one transaction each' % len(names)) \
+        and good
+    listed = read_ls(img, '/sub')
+    good = say(listed == keep, '  of them nothing is left in the directory' if listed == keep else
+               '  the directory still holds: %s' % (listed,)) and good
+    ok, ck = read_apfsck(img)
+    good = say(ok, '  apfsck finds no empty child left and no map record of a deleted node' +
+               ('' if ok else ':\n' + ck)) and good
+    moved = [l for l in (census(img) or '').splitlines()
+             if l not in (census(base) or '').splitlines()]
+    good = say(not moved, '  and of the whole volume nothing new is left' if not moved else
+               '  these entries are left: %s' % moved[:4]) and good
+
+
+def py_stat(image, path):
+    """apfs.py's stat: the Python reader's view of an inode, including its attributes."""
+    rc, out = run(sys.executable, os.path.join(HERE, 'apfs.py'), 'stat', image, path)
+    return out if rc == 0 else None
+
+
+def py_xattr(image, path, name):
+    """One attribute's value, straight out of the Python reader: the other witness, bytes and
+    all, not just the length apfs.py's stat prints."""
+    code = ('import sys, apfs\n'
+            'c = apfs.Container(sys.argv[1])\n'
+            'v = c.volumes()[0]\n'
+            'oid, _ = v.lookup(sys.argv[2])\n'
+            'd = v.xattr_bytes(oid, sys.argv[3])\n'
+            'sys.stdout.buffer.write(d or b"")\n')
+    p = subprocess.run([sys.executable, '-c', code, image, path, name], cwd=HERE,
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return None if p.returncode else p.stdout
+
+
+def test_xattrs():
+    """An attribute set, replaced, read back by the other reader and taken away.  The big value
+    is the one worth having: it does not fit a node beside its neighbours, so the tree splits
+    into three, and the parent and the root have to take it."""
+    base, img = fresh('xattr')
+    small = b'hello attr'
+    big = bytes((i * 11 + 5) & 0xff for i in range(3804))
+    good = True
+
+    rc, out = txn('txn-setxattr', img, '/one', 'com.test.one', '-', input=small)
+    good = say(rc == 0, 'set a 10-byte attribute' + ('' if rc == 0 else ':\n' + out.strip())) \
+        and good
+    st = py_stat(img, '/one') or ''
+    good = say('com.test.one(10,flags 0x2)' in st, '  apfs.py reads it back with its length') \
+        and good
+    ok, ck = read_apfsck(img)
+    good = say(ok, '  apfsck finds the container clean' + ('' if ok else ':\n' + ck)) and good
+
+    rc, out = txn('txn-setxattr', img, '/one', 'com.test.one', '-', input=big)
+    good = say(rc == 0, 'replace it with 3804 bytes, more than a node holds beside others' +
+               ('' if rc == 0 else ':\n' + out.strip())) and good
+    st = py_stat(img, '/one') or ''
+    good = say('com.test.one(3804,flags 0x2)' in st, '  apfs.py reads the whole value') and good
+    good = say(py_xattr(img, '/one', 'com.test.one') == big,
+               '  and every byte of it') and good
+    ok, ck = read_apfsck(img)
+    good = say(ok, '  apfsck finds the container clean' + ('' if ok else ':\n' + ck)) and good
+
+    rc, out = txn('txn-rmxattr', img, '/one', 'com.test.one')
+    good = say(rc == 0, 'remove it' + ('' if rc == 0 else ':\n' + out.strip())) and good
+    st = py_stat(img, '/one') or ''
+    good = say('com.test.one' not in st, '  and no reader sees it any more') and good
+    ok, ck = read_apfsck(img)
+    good = say(ok, '  apfsck finds the container clean' + ('' if ok else ':\n' + ck)) and good
+
+    rc, out = txn('txn-rmxattr', img, '/one', 'com.test.one')
+    say(rc != 0, 'refused: removing an attribute that is not there')
+    rc, out = txn('txn-setxattr', img, '/one', 'com.test.big', '-', input=big + b'x')
+    say(rc != 0 and 'Argument list too long' in out,
+        'refused: a value longer than an embedded one may be')
+    ok, ck = read_apfsck(img)
+    say(ok, 'apfsck still finds the container clean' + ('' if ok else ':\n' + ck))
+
+
 def expect_refusal(name, path, at, data, what, compress=False):
     base, img = fresh(name, compress)
     rc, out = write(img, path, at, data)
@@ -894,10 +1096,89 @@ def test_transaction():
     say(good, 'twenty transactions one after another, each one clean: both rings go round')
 
 
+def test_ops():
+    """The operations a file is asked for after it exists: a write at an offset, a grow, a
+    hard link and a symbolic link.  apfs_write.c does not see most of these (they change the
+    file-system tree), so the judgment is the independent readers and apfsck."""
+    base, img = fresh('ops')
+    data = bytes((i * 7 + 3) & 0xff for i in range(100 * 1024))
+
+    rc, out = txn('txn-create', img, '/', 'ops.bin')
+    good = say(rc == 0, 'create /ops.bin' + ('' if rc == 0 else ':\n' + out.strip()))
+    rc, out = txn('txn-append', img, '/ops.bin', '-', '1700000000000000000', input=data)
+    good = say(rc == 0, 'write 100 KB into it' + ('' if rc == 0 else ':\n' + out.strip())) and good
+
+    # growing is a hole after the old end, read as zeros
+    rc, out = txn('txn-truncate', img, '/ops.bin', str(200 * 1024))
+    good = say(rc == 0, 'grow it to 200 KB' + ('' if rc == 0 else ':\n' + out.strip())) and good
+    want = data + bytes(100 * 1024)
+    agree, bad = sparse_agree(img, '/ops.bin', want)
+    good = say(agree, '  every reader sees the old bytes and zeros after them' +
+               ('' if agree else ': ' + bad)) and good
+    ok, ck = read_apfsck(img)
+    good = say(ok, '  apfsck finds the container clean' + ('' if ok else ':\n' + ck)) and good
+
+    # a hard link: two names, one inode
+    rc, out = txn('txn-link', img, '/', 'ops.link', '/ops.bin')
+    good = say(rc == 0, 'link /ops.link -> /ops.bin' +
+               ('' if rc == 0 else ':\n' + out.strip())) and good
+    agree, bad = sparse_agree(img, '/ops.link', want)
+    good = say(agree, '  the second name reads the same bytes' +
+               ('' if agree else ': ' + bad)) and good
+    rc, out = txn('txn-unlink', img, '/', 'ops.bin')
+    good = say(rc == 0, 'unlink /ops.bin (the link stays)' +
+               ('' if rc == 0 else ':\n' + out.strip())) and good
+    left = read_py_bytes(img, '/ops.bin')
+    agree, bad = sparse_agree(img, '/ops.link', want)
+    good = say(left is None and agree, '  the old name is gone, the link has the bytes') and good
+    ok, ck = read_apfsck(img)
+    good = say(ok, '  apfsck finds the container clean' + ('' if ok else ':\n' + ck)) and good
+    rc, out = txn('txn-unlink', img, '/', 'ops.link')
+    ok, ck = read_apfsck(img)
+    good = say(rc == 0 and ok, 'unlink the last name, the file goes with it' +
+               ('' if rc == 0 and ok else ': ' + (out + ck).strip())) and good
+
+    # a symbolic link: the target lives in com.apple.fs.symlink
+    rc, out = txn('txn-symlink', img, '/', 'ops.sym', 'some/where else')
+    good = say(rc == 0, 'symlink /ops.sym -> some/where else' +
+               ('' if rc == 0 else ':\n' + out.strip())) and good
+    c = apfs.Container(img)
+    try:
+        vol = c.volumes()[0]
+        oid, _ = vol.lookup('/ops.sym')
+        ino = vol.inode(oid)
+        target = vol.xattrs(oid).get(apfs.SYMLINK_EA_NAME, (0, b''))[1]
+        good = say(ino.is_link and target == b'some/where else',
+                   '  it reads back as a link to the same target') and good
+    finally:
+        c.close()
+    ok, ck = read_apfsck(img)
+    good = say(ok, '  apfsck finds the container clean' + ('' if ok else ':\n' + ck)) and good
+
+    # cut short, then grown again: what was past the cut must not come back
+    rc = 0
+    rc2, out2 = txn('txn-create', img, '/', 'cut.bin')
+    rc3, out3 = txn('txn-append', img, '/cut.bin', '-', '1700000000000000000', input=data)
+    rc4, out4 = txn('txn-truncate', img, '/cut.bin', '1000')
+    rc5, out5 = txn('txn-truncate', img, '/cut.bin', '40000')
+    want = data[:1000] + bytes(39000)
+    agree, bad = sparse_agree(img, '/cut.bin', want)
+    good = say(rc == 0 and rc2 == 0 and rc3 == 0 and rc4 == 0 and rc5 == 0 and agree,
+               'cut to 1000 and grown to 40000: the cut bytes read as zeros' +
+               ('' if agree else ': ' + bad)) and good
+    ok, ck = read_apfsck(img)
+    good = say(ok, '  apfsck finds the container clean' + ('' if ok else ':\n' + ck)) and good
+    say(good, 'the operations after a write hold up')
+
+
 TESTS = {
     'baseline': test_baseline,
     'transaction': test_transaction,
     'writes': test_writes,
+    'names': test_names,
+    'ops': test_ops,
+    'empty': test_empty,
+    'xattrs': test_xattrs,
     'refusals': test_refusals,
     'volume-gates': test_volume_gates,
     'extent-gates': test_extent_gates,

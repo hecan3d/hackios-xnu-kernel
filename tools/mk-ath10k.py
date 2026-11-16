@@ -36,7 +36,11 @@ def archive(name):
         tmp = p.with_suffix(p.suffix + '.partial')
         run(['curl', '--fail', '--location', '--max-time', '180', url, '-o', tmp])
         tmp.replace(p)
-    if hashlib.file_digest(p.open('rb'), 'sha256').hexdigest() != sha:
+    h = hashlib.sha256()
+    with p.open('rb') as f:
+        while chunk := f.read(1024 * 1024):
+            h.update(chunk)
+    if h.hexdigest() != sha:
         raise RuntimeError(f'Checksum mismatch: {p}')
     return p
 
@@ -114,7 +118,7 @@ def driver_build():
         run(['awk', '-f', s / 'tools/makeobjops.awk', s / p, '-h'], cwd=gen)
     for mode in 'hpq':
         run(['awk', '-f', s / 'tools/vnode_if.awk', s / 'kern/vnode_if.src', f'-{mode}'], cwd=gen)
-    options = subprocess.check_output(['rg', '-o', '--no-filename', r'opt_[a-z0-9_]+\.h', s], text=True).split()
+    options = subprocess.check_output(['grep', '-rhoE', r'opt_[a-z0-9_]+\.h', s], text=True).split()
     for name in set(options + ['lkpi_iic_if.h']):
         (gen / name).touch()
     (gen / 'opt_global.h').write_text('#define SMP 1\n')

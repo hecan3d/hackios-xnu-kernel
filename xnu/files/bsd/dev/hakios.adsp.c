@@ -87,6 +87,8 @@
 #include <vm/memory_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
+
+extern int hakios_is_raphael(void);     /* hakios.input.c: which phone this kernel is on */
 #include <sys/kauth.h>
 #include <sys/stat.h>
 #include <sys/systm.h>
@@ -241,10 +243,17 @@ struct block {
 	vm_offset_t base;
 };
 
+static struct block ipcc;       /* its registers, or a scratch page on a SoC that has none */
+
 static void
 need(struct block *b)
 {
 	if (b->base == 0) {
+		if (b == &ipcc && hakios_is_raphael()) {
+			printf("adsp: there is no IPCC on this SoC: the doorbells go to a scratch page\n");
+			b->base = (vm_offset_t)kalloc_data(b->size, Z_WAITOK | Z_ZERO);
+			return;
+		}
 		b->base = ml_io_map(b->phys, b->size);
 	}
 }
@@ -287,10 +296,12 @@ put(struct block *b, const char *name, uint32_t offset, uint32_t value)
 
 /* ---- the shared memory (hakios.wifi.c, step 1) --------------------------------------------------- */
 
-#define SMEM_PHYS               0x80900000UL
+static unsigned long adsp_smem_phys = 0x80900000UL;    /* redwood; SM8150's is 0x86000000 (hakios.wifi.c says so) */
+#define SMEM_PHYS               adsp_smem_phys
 #define SMEM_SIZE               0x00200000u
 #define SMEM_US                 0
-#define SMEM_ADSP               2               /* dt: qcom,remote-pid of qcom,smp2p-adsp and qcom,glink/adsp */
+static uint16_t adsp_host = 2;                          /* dt: qcom,remote-pid of qcom,smp2p-adsp and qcom,glink/adsp */
+#define SMEM_ADSP               adsp_host
 #define SMEM_GLOBAL             0xfffe
 #define SMEM_CANARY             0xa5a5
 
@@ -437,7 +448,7 @@ static uint32_t
 smem_item(uint32_t item, uint32_t *size)
 {
 	static struct smem_item found[256];
-	static const uint16_t hosts[2][2] = { { SMEM_US, SMEM_ADSP }, { SMEM_GLOBAL, SMEM_GLOBAL } };
+	uint16_t hosts[2][2] = { { SMEM_US, SMEM_ADSP }, { SMEM_GLOBAL, SMEM_GLOBAL } };
 
 	for (unsigned h = 0; h < 2; h++) {
 		uint32_t cacheline = 0, partition_size = 0;
@@ -615,6 +626,45 @@ static struct block aoss = { "mailbox", 0x0c300000, 0x400 };
 #define IPCC_GLINK              0u
 #define IPCC_SMP2P              2u
 
+/*
+ * This phone's bits in the APCS IPC register (0x17c0000c), read off its own device tree
+ * (raphael.dts, out of the boot image): qcom,glink/adsp mboxes = <&apcs_glb 0x08>, and
+ * qcom,smp2p-adsp qcom,ipc = <&apcs 0 0x0a>.  The bits the driver rang before -- 12 and 14 -- are
+ * the modem's (<&apcs_glb 0x0c>, qcom,ipc 0x0e), which is why the audio DSP heard nothing: in p432
+ * it sent its version but never its ack, and in p428 it never acknowledged the request to stop.
+ * 0x18/0x1a are the sensors' DSP's, 0x04/0x06 the compute one's.
+ */
+#define APCS_LPASS_GLINK        8u
+#define APCS_LPASS_SMP2P        10u
+
+/*
+ * SM8150 has no IPCC: a doorbell to the always-on processor and to the DSPs is a write to the APCS
+ * IPC block (0x17c00000 + 0xc), a bit per processor and signal -- hakios.wifi.c does the same on
+ * this phone, and its messages to the AOP are taken (p415).  The IPCC write is kept for redwood;
+ * here it lands in the scratch page (need()).
+ */
+static void
+ipcc_send(uint32_t client, uint32_t signal)
+{
+	if (hakios_is_raphael()) {
+		static vm_offset_t apcs;
+
+		if (apcs == 0) {
+			apcs = ml_io_map(0x17c00000, 0x1000);
+		}
+		if (client == IPCC_AOP) {
+			wr(apcs + 0xc, 1);
+		} else if (signal == IPCC_SMP2P) {
+			wr(apcs + 0xc, 1u << APCS_LPASS_SMP2P);
+		} else {
+			wr(apcs + 0xc, 1u << APCS_LPASS_GLINK);
+		}
+		settle();
+	}
+	need(&ipcc);
+	wr(ipcc.base + IPCC_SEND, client << 16 | signal);
+}
+
 static struct block ipcc = { "ipcc", 0x00408000, 0x1000 };
 
 static struct {
@@ -666,7 +716,7 @@ mailbox_wait(uint32_t offset, uint32_t value, uint32_t ms)
 static void
 ring_aop(void)
 {
-	wr(ipcc.base + IPCC_SEND, IPCC_AOP << 16 | 0);
+	ipcc_send(IPCC_AOP, 0);
 }
 
 /* Linux's qmp_open(), as hakios.wifi.c does it; what is done already is found done. Under the mailbox's lock. */
@@ -783,7 +833,9 @@ out:
  * the list of its levels that the boot loader's command database keeps (cmd-db.c), the first
  * position at or above the level wanted.
  */
-#define CMD_DB_PHYS             0x80860000UL
+#define CMD_DB_PHYS             (hakios_is_raphael() ? 0x85f20000UL : 0x80860000UL)   /* as hakios.wifi.c: the */
+                                                                                    /* command database moved */
+                                                                                    /* with the reserved memory */
 #define CMD_DB_SIZE             0x20000UL
 
 struct cmd_db_slave {
@@ -941,6 +993,40 @@ rails(uint32_t level)
 
 /* ---- step 1: the shared memory --------------------------------------------------------------------- */
 
+/*
+ * The shared memory's table of partitions, as it stands: which hosts each one belongs to.  On
+ * raphael the audio DSP's host number is not the redwood's 2 (there is no partition for 0 and 2),
+ * so this lists the pairs and step 1's answer says which one to use.
+ */
+static void
+show_smem_table(void)
+{
+	struct smem_table table;
+	struct smem_table_entry entry;
+	unsigned shown = 0;
+
+	if (!smem_peek(SMEM_SIZE - 0x1000, &table, sizeof(table))) {
+		printf("adsp: %u: the shared memory's table cannot be read at %#lx\n", step, SMEM_PHYS + SMEM_SIZE - 0x1000);
+		return;
+	}
+	printf("adsp: %u: the table at %#lx: \"%c%c%c%c\", version %u, %u entries\n", step, SMEM_PHYS + SMEM_SIZE - 0x1000,
+	    table.magic[0], table.magic[1], table.magic[2], table.magic[3], table.version, table.count);
+	for (uint32_t i = 0; i < table.count && i < 64; i++) {
+		if (!smem_peek(SMEM_SIZE - 0x1000 + sizeof(table) + i * sizeof(entry), &entry, sizeof(entry))) {
+			break;
+		}
+		if (entry.size == 0) {
+			continue;
+		}
+		printf("adsp: %u:   entry %u: hosts %u and %u, at %#x, %#x bytes, flags %#x\n", step, i, entry.host0, entry.host1,
+		    entry.offset, entry.size, entry.flags);
+		if (++shown == 24) {
+			printf("adsp: %u:   ... (%u entries in all)\n", step, table.count);
+			break;
+		}
+	}
+}
+
 static bool
 step_survey(void)
 {
@@ -948,6 +1034,7 @@ step_survey(void)
 	uint32_t size = 0;
 
 	announce("read our partition with the audio DSP in the shared memory (0x80900000), and its items");
+	show_smem_table();
 	show_partition();
 	if (dsp_words(&words)) {
 		show_words("the DSP's item (443) is there: it has run since the phone was started", &words);
@@ -958,15 +1045,26 @@ step_survey(void)
 	    smem_item(ITEM_SMP2P_OURS, &size) ? "there" : "not there", smem_item(478, &size) ? "there" : "NOT THERE",
 	    smem_item(479, &size) ? "there" : "NOT THERE", smem_item(480, &size) ? "there" : "not there (the DSP makes it)");
 	show_crash_reason();
-	need(&ipcc);
-	printf("adsp: %u: the doorbells say %#x\n", step, rd(ipcc.base + IPCC_RECEIVED));
+	/*
+	 * SM8150 has no IPCC (it came with SM8250): its remote processors ring through the APCS shared
+	 * mailbox, and the interrupts are GIC_SPI 156 and 162.  Reading the IPCC's block here is an
+	 * external abort on this phone -- that is where step 1 hung (p352).
+	 */
+	if (hakios_is_raphael()) {
+		printf("adsp: %u: this SoC has no IPCC; the APCS mailbox and GIC_SPI 156/162 serve the doorbells\n", step);
+	} else {
+		need(&ipcc);
+		printf("adsp: %u: the doorbells say %#x\n", step, rd(ipcc.base + IPCC_RECEIVED));
+	}
 	return smem_partition(SMEM_US, SMEM_ADSP, &size, &size) != 0;
 }
 
 /* ---- step 2: the firmware -------------------------------------------------------------------------- */
 
-#define ADSP_MEMORY             0x86700000u     /* dt: reserved-memory adsp@86700000, memory-region of qcom,lpass@3700000 */
-#define ADSP_MEMORY_SIZE        0x04000000u
+static uint32_t adsp_memory = 0x86700000u;      /* dt: reserved-memory adsp@86700000, memory-region of qcom,lpass@3700000 */
+static uint32_t adsp_memory_size = 0x04000000u; /* raphael: adsp_mem 0x8be00000 + 0x1a00000 */
+#define ADSP_MEMORY             adsp_memory
+#define ADSP_MEMORY_SIZE        adsp_memory_size
 #define PAS_ADSP                1               /* dt: qcom,pas-id */
 
 
@@ -1119,6 +1217,8 @@ step_firmware(void)
 	}
 	image.header = header;
 	image.header_size = size;
+	printf("adsp: %u: the DSP's memory is %#x + %#x bytes (raphael: %d)\n", step, ADSP_MEMORY, ADSP_MEMORY_SIZE,
+	    hakios_is_raphael());
 	count = size >= 52 + 2 * 32 ? header[44] | header[45] << 8 : 0;
 	if (memcmp(header, "\177ELF\1", 5) != 0 || count < 3 || count > MAX_SEGMENTS || 52 + 32 * count > size || size > PAGE_SIZE) {
 		printf("adsp: %u: fw/adsp.mdt is not such a header (%02x %02x %02x %02x, %u segments, %llu bytes)\n", step, header[0],
@@ -1285,7 +1385,7 @@ dsp_listen(const struct smp2p *theirs)
 		    step, theirs->flags, smp2p_restart_acked);
 		smem_poke(our_item + SMP2P_AT_FLAGS, (ours.flags & ~SMP2P_RESTART_ACK) | (smp2p_restart_acked ? SMP2P_RESTART_ACK : 0));
 		settle();
-		wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_SMP2P);
+		ipcc_send(IPCC_LPASS, IPCC_SMP2P);
 	}
 }
 
@@ -1323,7 +1423,7 @@ dsp_ask_to_stop(uint32_t bound_ms)
 	snprintf(last_write, sizeof(last_write), "step %u asked the audio DSP to stop", step);
 	smem_poke(value_at, ours.entry[entry].value | DSP_STOP);
 	settle();
-	wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_SMP2P);
+	ipcc_send(IPCC_LPASS, IPCC_SMP2P);
 	asked = now = now_us();
 	while (now - asked < bound_ms * 1000ull) {
 		if (dsp_words(&theirs) && (dsp_state(&theirs) & (DSP_STOP_ACK | DSP_FATAL))) {
@@ -1338,7 +1438,7 @@ dsp_ask_to_stop(uint32_t bound_ms)
 	    (now - asked) % 1000, state);
 	smem_poke(value_at, ours.entry[entry].value & ~DSP_STOP);
 	settle();
-	wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_SMP2P);
+	ipcc_send(IPCC_LPASS, IPCC_SMP2P);
 	return (state & DSP_STOP_ACK) != 0;
 }
 
@@ -1449,25 +1549,35 @@ static bool
 step_image(void)
 {
 	volatile uint64_t *dsp_memory;
+	static bool unaligned[MAX_SEGMENTS];
 	uint64_t written = 0, cleared = 0, wrong = 0;
 
 	if (image.segments == 0) {
 		return false;
 	}
-	announce("put the image's segments into the audio DSP's memory (0x86700000, 64 MB: memory of nobody's until TrustZone "
-	    "starts the DSP), with zeroes where a segment is longer than its file, and read them back");
+	announce("put the image's segments into the audio DSP's memory (of nobody's until TrustZone starts the DSP), with "
+	    "zeroes where a segment is longer than its file, and read them back");
 	dsp_memory = (volatile uint64_t *)ml_io_map_unmappable(ADSP_MEMORY, ADSP_MEMORY_SIZE, VM_WIMG_WCOMB);
 	snprintf(last_write, sizeof(last_write), "step %u wrote the image at %#x", step, ADSP_MEMORY);
 	for (unsigned s = 0; s < image.segments; s++) {
 		volatile uint64_t *to = dsp_memory + image.segment[s].at / 8;
 
+		/*
+		 * The DSP's image has segments that neither begin nor end on a multiple of eight (p424:
+		 * segment 9, 0x54 bytes at 0x8c4b4000): those are written a byte at a time, the rest a word
+		 * at a time.  Refusing them was wrong -- the memory takes either.
+		 */
 		if ((image.segment[s].at | image.segment[s].memory_size) & 7) {
-			printf("adsp: %u: a segment that does not begin and end at a multiple of eight bytes: not written\n", step);
-			ml_io_unmap((vm_offset_t)dsp_memory, ADSP_MEMORY_SIZE);
-			return false;
-		}
-		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
-			to[i / 8] = segment_word(s, i);
+			volatile uint8_t *bytes = (volatile uint8_t *)dsp_memory + image.segment[s].at;
+
+			for (uint32_t i = 0; i < image.segment[s].memory_size; i++) {
+				bytes[i] = i < image.segment[s].file_size ? image.segment[s].file[i] : 0;
+			}
+			unaligned[s] = true;
+		} else {
+			for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
+				to[i / 8] = segment_word(s, i);
+			}
 		}
 		written += image.segment[s].file_size;
 		cleared += image.segment[s].memory_size - image.segment[s].file_size;
@@ -1476,6 +1586,14 @@ step_image(void)
 	for (unsigned s = 0; s < image.segments; s++) {
 		volatile uint64_t *from = dsp_memory + image.segment[s].at / 8;
 
+		if (unaligned[s]) {
+			volatile uint8_t *bytes = (volatile uint8_t *)dsp_memory + image.segment[s].at;
+
+			for (uint32_t i = 0; i < image.segment[s].memory_size; i++) {
+				wrong += bytes[i] != (i < image.segment[s].file_size ? image.segment[s].file[i] : 0);
+			}
+			continue;
+		}
 		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
 			wrong += from[i / 8] != segment_word(s, i);
 		}
@@ -1491,24 +1609,29 @@ step_image(void)
 
 /* ---- step 6: our SMP2P item ------------------------------------------------------------------------ */
 
+/* GLINK's three items in our partition with the DSP (dt: qcom,glink/adsp <478 479 480>) */
+#define ITEM_GLINK_DESCRIPTOR   478
+#define ITEM_GLINK_OUR_QUEUE    479
+#define ITEM_GLINK_THEIR_QUEUE  480
+
 static struct block smem_lock = { "shared memory's lock", 0x01f43000, 0x1000 };
 #define LOCK_OWNER              0x000
 #define LOCK_US                 1u
 
 /* Our item made in the partition, as Linux's qcom_smem_alloc_private() makes one (hakios.wifi.c: our_item_make()). */
 static bool
-our_item_make(uint32_t partition)
+smem_make_item(uint32_t partition, uint32_t item, uint32_t size)
 {
 	struct smem_partition header;
 	struct smem_entry entry;
-	const uint32_t item_size = (sizeof(struct smp2p) + 7) & ~7u, need_bytes = sizeof(entry) + item_size;
+	const uint32_t item_size = size, need_bytes = sizeof(entry) + item_size;
 	uint32_t owner = ~0u, at;
 	bool made = false;
 
 	lck_mtx_lock(&hakios_smem_alloc_lock);         /* (the Wi-Fi's start allocates under the same hardware lock) */
 	need(&smem_lock);
 	printf("adsp: %u: about to take the lock (%#x), write an entry for item %u with %u bytes behind it at the partition's mark, "
-	    "move the mark by %u, and release the lock\n", step, smem_lock.phys + LOCK_OWNER, ITEM_SMP2P_OURS, item_size, need_bytes);
+	    "move the mark by %u, and release the lock\n", step, smem_lock.phys + LOCK_OWNER, item, item_size, need_bytes);
 	snprintf(last_write, sizeof(last_write), "step %u took the shared memory's lock", step);
 	for (uint32_t ms = 0; ms <= 1000; ms++) {
 		wr(smem_lock.base + LOCK_OWNER, LOCK_US);
@@ -1529,7 +1652,7 @@ our_item_make(uint32_t partition)
 		goto out;
 	}
 	for (at = sizeof(header); at < header.free_uncached;) {
-		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == ITEM_SMP2P_OURS ||
+		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == item ||
 		    entry.size > header.size) {
 			break;
 		}
@@ -1544,9 +1667,9 @@ our_item_make(uint32_t partition)
 		printf("adsp: %u: no room: %u bytes wanted, %u free: nothing is written\n", step, need_bytes, header.free_cached - at);
 		goto out;
 	}
-	smem_poke(partition + at, SMEM_CANARY | ITEM_SMP2P_OURS << 16);
+	smem_poke(partition + at, SMEM_CANARY | item << 16);
 	smem_poke(partition + at + 4, item_size);
-	smem_poke(partition + at + 8, item_size - (uint32_t)sizeof(struct smp2p));
+	smem_poke(partition + at + 8, 0);
 	smem_poke(partition + at + 12, 0);
 	settle();
 	smem_poke(partition + __offsetof(struct smem_partition, free_uncached), at + need_bytes);
@@ -1557,6 +1680,12 @@ out:
 	printf("adsp: %u: the lock is released (it reads %u)\n", step, rd(smem_lock.base + LOCK_OWNER));
 	lck_mtx_unlock(&hakios_smem_alloc_lock);
 	return made;
+}
+
+static bool
+our_item_make(uint32_t partition)
+{
+	return smem_make_item(partition, ITEM_SMP2P_OURS, (sizeof(struct smp2p) + 7) & ~7u);
 }
 
 static void glink_reset(void);
@@ -1608,12 +1737,31 @@ step_our_item(void)
 	settle();
 	smp2p_agreed = smp2p_restart_acks = smp2p_restart_acked = false;
 	need(&ipcc);
-	wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_SMP2P);
+	ipcc_send(IPCC_LPASS, IPCC_SMP2P);
 	if (!smem_peek(our_item, &ours, sizeof(ours)) || ours.magic != SMP2P_MAGIC || smp2p_entry(&ours, OUR_ENTRY_STOP) < 0) {
 		printf("adsp: %u: OUR ITEM DOES NOT READ BACK AS WRITTEN\n", step);
 		return false;
 	}
 	show_words("our item reads back", &ours);
+	{
+		uint32_t qsize = 0;
+
+		if (smem_item(ITEM_GLINK_OUR_QUEUE, &qsize) == 0 && smem_make_item(partition, ITEM_GLINK_OUR_QUEUE, 16384)) {
+			uint32_t queue = smem_item(ITEM_GLINK_OUR_QUEUE, &qsize);
+
+			if (queue != 0) {
+				for (uint32_t at = 0; at < 16384; at += 4) {
+					smem_poke(queue + at, 0);
+				}
+				settle();
+				printf("adsp: %u: our GLINK queue (item %u) made: %u bytes at %#lx\n", step, ITEM_GLINK_OUR_QUEUE, qsize,
+				    SMEM_PHYS + queue);
+				glink_reset();
+			}
+		} else if (qsize != 0) {
+			printf("adsp: %u: our GLINK queue (item %u) is there: %u bytes\n", step, ITEM_GLINK_OUR_QUEUE, qsize);
+		}
+	}
 	glink_reset();
 	return true;
 }
@@ -1766,9 +1914,7 @@ step_start(void)
 
 /* ---- GLINK (hakios.wifi.c; items 478 to 480 of our partition with the audio DSP) ------------------- */
 
-#define ITEM_GLINK_DESCRIPTOR   478
-#define ITEM_GLINK_OUR_QUEUE    479
-#define ITEM_GLINK_THEIR_QUEUE  480
+
 #define GLINK_OUR_TAIL          0
 #define GLINK_OUR_HEAD          4
 #define GLINK_THEIR_TAIL        8
@@ -1943,7 +2089,7 @@ glink_put(const void *first, uint32_t first_length, const void *second, uint32_t
 	settle();
 	smem_poke(glink.descriptor + GLINK_OUR_HEAD, (head + padded) % glink.ours_size);
 	settle();
-	wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_GLINK);
+	ipcc_send(IPCC_LPASS, IPCC_GLINK);
 	glink.said++;
 	return true;
 }
@@ -2174,7 +2320,7 @@ glink_pump(void)
 		}
 		case GLINK_READ_NOTIFY:
 			glink_advance(length);
-			wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_GLINK);
+			ipcc_send(IPCC_LPASS, IPCC_GLINK);
 			break;
 		case GLINK_CLOSE:
 			glink_advance(length);
@@ -3007,14 +3153,23 @@ step_link(void)
 		return false;
 	}
 	thread_deallocate(thread);
-	for (unsigned ms = 0; ms < 5000 && !glink.channel[CHANNEL_QRTR].open && !glink.broken; ms++) {
+	for (unsigned ms = 0; ms < 10000 && !glink.channel[CHANNEL_QRTR].open && !glink.broken; ms++) {
 		sleep_ms(1);
+		if ((ms % 2000) == 1999 && !glink.agreed) {
+			lck_mtx_lock(&glink_lock);
+			glink_say(GLINK_VERSION, GLINK_VERSION_1, glink.features, NULL, 0);
+			lck_mtx_unlock(&glink_lock);
+			printf("adsp: %u: %u ms, no ack yet: our version is sent again\n", step, ms + 1);
+		}
 	}
 	sleep_ms(50);
 	printf("adsp: %u: %llu ms after our version: versions %s (features %#x); the channel \"IPCRTR\" is %s, \"apr_audio_svc\" %s; "
 	    "the DSP also opened \"%s\" \"%s\" \"%s\" \"%s\"\n", step, (now_us() - began) / 1000, glink.agreed ? "agreed" :
 	    "NOT AGREED", glink.features, glink.channel[CHANNEL_QRTR].open ? "OPEN" : "NOT OPEN",
 	    glink.channel[CHANNEL_APR].open ? "OPEN" : "NOT OPEN", glink.others[0], glink.others[1], glink.others[2], glink.others[3]);
+	printf("adsp: %u: our queue: written to %#x, read by the DSP to %#x; the DSP's queue: written to %#x, read by us to %#x\n", step,
+	    smem_word(glink.descriptor + GLINK_OUR_HEAD), smem_word(glink.descriptor + GLINK_OUR_TAIL),
+	    smem_word(glink.descriptor + GLINK_THEIR_HEAD), smem_word(glink.descriptor + GLINK_THEIR_TAIL));
 	return glink.channel[CHANNEL_QRTR].open;
 }
 
@@ -3202,6 +3357,23 @@ hakios_adsp_init(void)
 	uint32_t on = 0;
 	thread_t thread;
 
+	if (hakios_is_raphael()) {
+		adsp_smem_phys = 0x86000000UL;
+		adsp_memory = 0x8be00000u;
+		adsp_memory_size = 0x02200000u;     /* 0x8be00000..0x8e000000 (34 MB); the modem's memory starts there (p423) */
+	}
+	{
+		uint32_t hosts = 0, phys = 0;
+
+		if (PE_parse_boot_argn("adsp_hosts", &hosts, sizeof(hosts)) && (hosts & 0xffff) != 0) {
+			adsp_host = (uint16_t)(hosts & 0xffff);
+			printf("adsp: the audio DSP's host number is %u (adsp_hosts)\n", adsp_host);
+		}
+		if (PE_parse_boot_argn("adsp_smem", &phys, sizeof(phys)) && phys != 0) {
+			adsp_smem_phys = phys;
+			printf("adsp: the shared memory is at %#lx (adsp_smem)\n", adsp_smem_phys);
+		}
+	}
 	PE_parse_boot_argn("adsp_step", &last_step, sizeof(last_step));
 	if (last_step == 0 && (!PE_parse_boot_argn("adsp", &on, sizeof(on)) || on != 1)) {
 		return;

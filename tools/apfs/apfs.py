@@ -610,6 +610,8 @@ class Volume:
         want = (obj_id, rec_type)
 
         def less(k):
+            if len(k) < 8:
+                return True
             v = struct.unpack_from("<Q", k, 0)[0]
             return (v & OBJ_ID_MASK, v >> OBJ_TYPE_SHIFT) < want
 

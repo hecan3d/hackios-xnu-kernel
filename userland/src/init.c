@@ -604,8 +604,65 @@ copy_file(const char *from, const char *to, int mode, int uid, int gid)
 	return ok;
 }
 
-/*
- * Everything under a directory to one owner: the user's corner of the prefix belongs to mobile, and
+/* ---- prefetched paths (see /redwood/etc/prefetch.paths below) ----------------------------------- */
+
+static uint64_t prefetched_bytes;
+
+static void
+prefetch_file(const char *path)
+{
+	static char buf[65536];
+	ssize_t n;
+	int fd;
+
+	if ((fd = open(path, O_RDONLY, 0)) < 0) {
+		return;
+	}
+	while ((n = read(fd, buf, sizeof(buf))) > 0) {
+		prefetched_bytes += (uint64_t)n;
+	}
+	close(fd);
+}
+
+static void
+prefetch_path(const char *path, int depth)
+{
+	char buf[4096], child[512];
+	struct stat st;
+	off_t position = 0;
+	ssize_t n;
+	int fd;
+
+	if (lstat(path, &st) != 0) {
+		return;
+	}
+	if ((st.st_mode & S_IFMT) != S_IFDIR) {
+		prefetch_file(path);
+		return;
+	}
+	if (depth <= 0 || (fd = open(path, O_RDONLY | O_DIRECTORY, 0)) < 0) {
+		return;
+	}
+	while ((n = getdirentries(fd, buf, sizeof(buf), &position)) > 0) {
+		for (ssize_t at = 0; at < n; at += ((struct dirent *)(buf + at))->d_reclen) {
+			const char *name = ((struct dirent *)(buf + at))->d_name;
+
+			if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+				continue;
+			}
+			if (strlen(path) + strlen(name) + 2 > sizeof(child)) {
+				continue;
+			}
+			strcpy(child, path);
+			strcpy(child + strlen(child), "/");
+			strcpy(child + strlen(child), name);
+			prefetch_path(child, depth - 1);
+		}
+	}
+	close(fd);
+}
+
+/* Everything under a directory to one owner: the user's corner of the prefix belongs to mobile, and
  * what an application of the prefix makes there later (caches, databases) must belong to it too.
  */
 static int
@@ -1024,10 +1081,21 @@ mount_writable(void)
 		} else if (count == 3 && f[0][0] == 'l') {
 			symlink(f[1], f[2]);
 		} else if (count == 6 && f[0][0] == 'f') {
-			/* a file of ours to start with (build.sh: the var/ directory): mode, owner, group, path, source in the image */
-			if (!copy_file(in_image(f[5]), f[4], (int)parse_number(f[1], 8), (int)parse_number(f[2], 10),
-			    (int)parse_number(f[3], 10))) {
-				printf("  %s: %s\n", f[4], strerror(errno));
+			/*
+			 * A file of ours to start with (build.sh: the var/ directory): mode, owner, group, path,
+			 * source in the image.  The volume is on the phone's flash now and keeps what iOS wrote
+			 * into it, so a file that is already there is the system's own -- preferences, the home
+			 * screen's layout -- and copying the image's copy over it would undo every setting at
+			 * every boot (which is exactly what happened before: .GlobalPreferences.plist and
+			 * com.apple.springboard.plist came back from the image each time).
+			 */
+			struct stat there;
+
+			if (stat(f[4], &there) != 0) {
+				if (!copy_file(in_image(f[5]), f[4], (int)parse_number(f[1], 8), (int)parse_number(f[2], 10),
+				    (int)parse_number(f[3], 10))) {
+					printf("  %s: %s\n", f[4], strerror(errno));
+				}
 			}
 			files++;
 		}
@@ -1338,6 +1406,43 @@ mount_writable(void)
 	}
 
 	/*
+	 * /redwood/etc/prefetch.paths: one path a line; a directory is walked three levels down and
+	 * every file under it is read once.  The window server maps its bitmaps through
+	 * CPBitmapCreateMappedDataFromPath (AppSupport) and faults their pages in as it draws; on the
+	 * data volume such a fault is a block request to the loader (0.44 ms for 4 KB, taken under the
+	 * APFS mount lock), and the first wallpaper draw took 4.1 s in p408 while the main thread
+	 * waited for it.  What is read here is already in the page cache when the drawing starts.
+	 */
+	{
+		static char list[1024];
+
+		if (read_whole("/redwood/etc/prefetch.paths", list, sizeof(list)) > 0) {
+			const char *line = list;
+			struct timeval t0, t1;
+
+			gettimeofday(&t0, NULL);
+			while (line != NULL && line[0] != 0 && line[0] != '\n') {
+				const char *end = strchr(line, '\n');
+				size_t length = end != NULL ? (size_t)(end - line) : strlen(line);
+
+				if (length > 0 && length < 256) {
+					char path[256];
+					uint64_t before = prefetched_bytes;
+
+					memcpy(path, line, length);
+					path[length] = 0;
+					prefetch_path(path, 3);
+					printf("  prefetched %llu bytes from %s\n", prefetched_bytes - before, path);
+				}
+				line = end != NULL ? end + 1 : NULL;
+			}
+			gettimeofday(&t1, NULL);
+			printf("  prefetched %llu bytes in %ld ms\n", prefetched_bytes,
+			    (long)(((t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_usec - t0.tv_usec)) / 1000));
+		}
+	}
+
+	/*
 	 * mcm_db_ram=1: the container manager's own database in memory.  On the APFS data volume
 	 * every SQLite write it makes costs it a second (p285: 0.3-2 s per container query, 4-6 ms
 	 * in RAM), and LaunchServices asks it once per application while building its store, which
@@ -1473,7 +1578,8 @@ mount_writable(void)
 			}
 			{
 				char *argv[] = { "/var/jb/bin/sh", "-c",
-					"echo SHELL-SAYS-HI; id; echo PATH=$PATH", NULL };
+					"echo SHELL-SAYS-HI; id; echo PATH=$PATH; echo PTY-TEST:; "
+				    "script -q /dev/null /var/jb/bin/sh -c \"echo PTY-SAYS-HI; tty\"", NULL };
 				char *envp[] = { "PATH=/var/jb/bin:/var/jb/usr/bin:/usr/bin:/bin",
 					"HOME=/var/mobile", NULL };
 				int status = 0;

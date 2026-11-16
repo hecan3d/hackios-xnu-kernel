@@ -2518,6 +2518,7 @@ op_write(struct fs_ctx *fc, void *arg)
 {
 	struct write_arg *a = arg;
 	uint32_t bs = apfs_txn_block_size(fc->txn);
+	uint32_t k;
 	struct apfs_inode ino;
 	struct fs_ext_list l;
 	uint8_t *ival = NULL, *blk = NULL, *ds;
@@ -2650,18 +2651,13 @@ op_write(struct fs_ctx *fc, void *arg)
 			if (i == l.n && i > 0 && l.e[i - 1].phys != 0 &&
 			    l.e[i - 1].logical + l.e[i - 1].length == boff &&
 			    l.e[i - 1].phys + l.e[i - 1].length / bs == phys) {
-				/* one run of blocks, one extent record */
+				/* one run of blocks, one extent record -- and it goes in after the loop */
 				l.e[i - 1].length += bs;
-				error = fs_emit_run(fc, sid, l.e[i - 1].logical,
-				    l.e[i - 1].phys, (uint32_t)(l.e[i - 1].length / bs));
 			} else {
 				error = fs_ext_list_add(&l, boff, bs, phys);
-				if (error == 0) {
-					error = fs_emit_run(fc, sid, boff, phys, 1);
+				if (error) {
+					goto out_list;
 				}
-			}
-			if (error) {
-				goto out_list;
 			}
 			fc->data_delta++;
 		}
@@ -2671,6 +2667,28 @@ op_write(struct fs_ctx *fc, void *arg)
 			goto out_list;
 		}
 		at += take;
+	}
+
+	/*
+	 * The extent records once, after the whole write, and not once per block: a record per
+	 * 4 KB block was a search of the volume's tree and a copy-on-write of its path, so a
+	 * write of a few megabytes staged thousands of blocks -- and every write held the
+	 * writer's mutex for as long as putting them out took (p393: 0.3 to 1.1 s a time;
+	 * p394: SpringBoard's pwrite of the wallpaper's cache, 4 s, and everything else waited).
+	 *
+	 * Only the extents the write touched: p397 wrote all of them out every time, so a file
+	 * grown in small appends re-recorded its whole length on every append (and the boot
+	 * never got as far as the first frame).
+	 */
+	for (k = 0; k < l.n; k++) {
+		if (l.e[k].phys != 0 && l.e[k].logical + l.e[k].length > a->off &&
+		    l.e[k].logical < end) {
+			error = fs_emit_run(fc, sid, l.e[k].logical, l.e[k].phys,
+			    (uint32_t)(l.e[k].length / bs));
+			if (error) {
+				goto out_list;
+			}
+		}
 	}
 
 	if (end > size) {

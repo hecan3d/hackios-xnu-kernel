@@ -49,9 +49,63 @@
 #define BLOCK           4096
 #define BUFFER          (4u << 20)              /* the loader's own buffer: one request a write */
 #define STORE_AT        8589934592LL            /* darwin's block 2097152: past the cryptexes, with room to spare */
-#define SLOT_BYTES      0x80000000LL            /* 2 GiB a slot, two slots */
+#define STORE_AT_RAPHAEL 107374182400LL         /* userdata's 100 GiB: past the 48 GiB APFS volume that begins at 8 */
+#define SLOT_BYTES      0x500000000LL            /* 2 GiB a slot, two slots */
 #define SLOTS           2
 static const char *store_device = "/dev/rufs_darwin";
+static off_t store_at = STORE_AT;
+
+/*
+ * var_load_only=1: put back only what LaunchServices needs to find its store already made --
+ * the store's own container, the system containers that hold the caches, the install journal and
+ * the SpringBoard layout.  Unpacking the whole volume onto the APFS volume costs a hundred
+ * milliseconds a write; the store is a few megabytes, the volume is a hundred.
+ */
+static int
+has_at(const char *haystack, const char *needle)
+{
+	size_t n = strlen(needle), h = strlen(haystack);
+
+	if (n == 0 || h < n) {
+		return 0;
+	}
+	for (size_t i = 0; i + n <= h; i++) {
+		size_t k = 0;
+
+		while (k < n && haystack[i + k] == needle[k]) {
+			k++;
+		}
+		if (k == n) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static int load_only;
+static const char *const KEEP[] = {
+	"systemgroup.com.apple.lsd",
+	"containers/Data/System",
+	"MobileInstallation",
+	"db/lsd",
+	"Caches/com.apple.LaunchServices",
+	"mobile/Library/SpringBoard",
+	NULL,
+};
+
+static int
+worth_unpacking(const char *relative)
+{
+	if (!load_only) {
+		return 1;
+	}
+	for (int i = 0; KEEP[i] != NULL; i++) {
+		if (has_at(relative, KEEP[i])) {
+			return 1;
+		}
+	}
+	return 0;
+}
 #define ROOT            "/private/var"
 #define MAX_PATH        1024
 #define MAX_DEPTH       32
@@ -236,7 +290,7 @@ static uint64_t entries;
 static off_t
 slot_at(int slot)
 {
-	return STORE_AT + (off_t)slot * SLOT_BYTES;
+	return store_at + (off_t)slot * SLOT_BYTES;
 }
 
 static int
@@ -955,6 +1009,9 @@ unpack_one(int make)
 		return 0;
 	}
 	relative[e.pathlen] = 0;
+	if (!worth_unpacking(relative)) {
+		make = 0;               /* read past it: the rest of the volume stays as it is on the flash */
+	}
 	if (make && !whole_path(relative, e.pathlen)) {
 		make = 0;               /* read past it: an archive is not to make names of its own choosing */
 	}
@@ -1362,7 +1419,24 @@ main(int argc, char **argv, char **envp)
 
 	(void)envp;
 	crc_init();
-	if (boot_arg_is("root_apfs", "ufs_userdata")) store_device = "/dev/rufs_userdata";
+	load_only = boot_arg_is("var_load_only", "1");
+	if (boot_arg_is("root_apfs", "ufs_userdata")) {
+		store_device = "/dev/rufs_userdata";
+	}
+	/* Raphael has no darwin partition: the one the kernel takes writes in is userdata, and its
+	 * first 8 GiB hold the APFS volume.  The archive goes to 100 GiB of it, past that volume
+	 * and well inside the partition (111 GiB).  Decided by which node is there, so both layouts
+	 * of the port work without a new boot argument. */
+	{
+		struct stat st;
+		int darwin = stat("/dev/rufs_darwin", &st) == 0;
+		int userdata = stat("/dev/rufs_userdata", &st) == 0;
+
+		if (!darwin && userdata) {
+			store_device = "/dev/rufs_userdata";
+			store_at = (off_t)STORE_AT_RAPHAEL;
+		}
+	}
 	if (strcmp(what, "stamp") == 0) {
 		return stamp(argc > 2 ? argv[2] : "/private/var/hakios-stamp") ? 0 : 1;
 	}

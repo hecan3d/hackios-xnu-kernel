@@ -17,11 +17,33 @@ fragment@3/__overlay__/qcom,pm8150b@3/qcom,haptics@c000
     compatible                   qcom,haptics
     reg                          0xc000, size 0x100        (SPMI slave 3)
     interrupts                   hap-sc-irq, hap-play-irq
-    qcom,actuator-type           lra
+    qcom,actuator-type           erm                      <- NOT lra (0x65726d00; the first reading of this file had it wrong)
     qcom,vmax-mv                 3000
     qcom,play-rate-us            6667
-    qcom,lra-resonance-sig-shape sine
+    qcom,lra-resonance-sig-shape sine                       (the LRA properties are there, but for an ERM the
+                                                             driver never uses them: no shape, no auto resonance)
 ```
+
+The registers Android's own kernel leaves in the block (read in OrangeFox through
+`/sys/kernel/debug/regmap/spmi0-03/registers`, haptics = `c000..c0ff`; the driver's own parsed
+values are in `/sys/kernel/debug/haptics/effect0..5/`):
+
+```
+c046 80   the module enabled, and left enabled between effects
+c048 02   auto standby on, the brake off
+c04a fd   bridge, PWM, DAC, limiting; no zero-crossing hysteresis
+c04b 00   auto resonance not used (ERM)
+c04c 01   the actuator: ERM        <- the one value that matters; 0x00 (LRA) plays nothing
+c04d 01   (shape; untouched for an ERM)
+c04f 90   c050 01   c053 01   c056 01   c058 01   c05a 03
+c051 32   2900 mV (3000 mV in steps of 116)
+c052 00   400 mA
+c054 35  c055 05   6665 us (6667 in steps of 5)
+c05e 00   the repeat count
+c070 00   PLAY, write-only: it reads 0 even while the motor runs
+c00a 82   STATUS1: 0x82 both idle and playing (static flags), not a "busy" bit
+```
+
 
 Six waveforms follow as children (`wf_0` … `wf_5`), each `qcom,effect-id` 0…5 with
 `qcom,wf-vmax-mv 3000` and:
