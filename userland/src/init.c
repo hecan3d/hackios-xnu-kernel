@@ -581,12 +581,18 @@ parse_number(const char *text, int radix)
  * memory-backed filesystem and the directories a system expects there.
  * (/tmp is a symlink to /private/var/tmp, as on iOS.)
  */
+static unsigned copied_files;
+
 static int
 copy_file(const char *from, const char *to, int mode, int uid, int gid)
 {
 	static char buf[4096];
 	int in = open(from, O_RDONLY, 0), out, ok = 0;
 	ssize_t n;
+
+	if (++copied_files % 500 == 0) {
+		printf("  copying the prefix: %u files\n", copied_files);
+	}
 
 	if (in < 0) {
 		return 0;
@@ -831,9 +837,9 @@ copy_tree(const char *from, const char *to, int *files)
 static const char *const graft_copy[] = { "Library", "etc", "var", "tmp" };
 
 static int
-graft_tree(const char *from, const char *to, int top, int *made, int *linked)
+graft_tree(const char *from, const char *to, int top, int full, int *made, int *linked)
 {
-	char buf[4096], f[512], t[512];
+	char buf[4096], f[512], t[512], target[512];
 	struct stat st;
 	off_t position = 0;
 	ssize_t n;
@@ -870,15 +876,31 @@ graft_tree(const char *from, const char *to, int top, int *made, int *linked)
 			strcpy(t, to);
 			strcpy(t + strlen(t), "/");
 			strcpy(t + strlen(t), name);
-			for (unsigned i = 0; top && i < sizeof(graft_copy) / sizeof(graft_copy[0]); i++) {
-				copy_it = copy_it || strcmp(name, graft_copy[i]) == 0;
+			if (top && full) {
+				/* a prefix of our own: every entry is copied, and the volume it came from is not needed again */
+				copy_it = 1;
+			} else {
+				for (unsigned i = 0; top && i < sizeof(graft_copy) / sizeof(graft_copy[0]); i++) {
+					copy_it = copy_it || strcmp(name, graft_copy[i]) == 0;
+				}
 			}
 			if (lstat(f, &st) != 0) {
 				ok = 0;
-			} else if (copy_it) {
-				ok = copy_tree(f, t, linked);
 			} else if ((st.st_mode & S_IFMT) == S_IFDIR) {
-				ok = graft_tree(f, t, 0, made, linked);
+				ok = copy_it ? copy_tree(f, t, linked) : graft_tree(f, t, 0, 0, made, linked);
+			} else if ((st.st_mode & S_IFMT) == S_IFLNK) {
+				/*
+				 * A link is kept with its own target when the prefix is copied as it is (a
+				 * link to the read-only volume would point at the wrong place otherwise).
+				 */
+				ssize_t length = readlink(f, target, sizeof(target) - 1);
+
+				target[length > 0 ? length : 0] = 0;
+				ok = length > 0 && make_link(copy_it ? target : f, t);
+				(*linked)++;
+			} else if (copy_it) {
+				ok = copy_file(f, t, st.st_mode & 07777, 0, 0);
+				(*linked)++;
 			} else {
 				ok = make_link(f, t);
 				(*linked)++;
@@ -1510,7 +1532,95 @@ mount_writable(void)
 				printf("  the prefix on /private/preboot/jb-rw: %s\n", strerror(errno));
 			}
 		}
-		grafted = graft_tree(jb, to, 1, &dirs, &entries);
+		{
+			struct stat there;
+			/*
+			 * Two shapes of /private/var/jb.  The old one: the four directories that a package manager
+			 * writes over are copied and everything else is a link back into /jb -- apt can update its
+			 * lists, and nothing can be installed, because usr and bin are the read-only volume's.
+			 * The new one, asked for by a file in the payload (/redwood/etc/jb.copy): the whole prefix
+			 * is copied on the boot after the flag appears, and every boot after that leaves it alone,
+			 * so what apt installs stays installed.  A real directory at jb/usr is what says which
+			 * one this is.
+			 */
+			/*
+			 * A marker of our own says which shape this is: lstat on jb/usr answers for the link's
+			 * target here, so a copy cannot be told from the old graft by its mode.
+			 */
+			int own = stat("/private/var/jb/.hakios-copy", &there) == 0;
+			int full = stat("/redwood/etc/jb.copy", &there) == 0;
+
+			if (own) {
+				printf("  the prefix in /private/var/jb is its own copy: left as it is\n");
+				grafted = 1;
+			} else {
+				if (full) {
+					/*
+					 * The old shape is in the way: a symlink at jb/usr cannot become a directory.  One
+					 * rename moves all of it aside (it stays on the volume, for a look), and the copy
+					 * starts from an empty name.
+					 */
+					if (rename("/private/var/jb", "/private/var/jb.old") == 0) {
+						printf("  the old prefix moved to /private/var/jb.old\n");
+					} else if (errno != 2) {
+						if (rename("/private/var/jb", "/private/var/jb.old2") == 0) {
+							printf("  the old prefix moved to /private/var/jb.old2\n");
+						} else {
+							printf("  the old prefix: %s\n", strerror(errno));
+						}
+					}
+					/*
+					 * A half-made copy of an earlier boot is in the way, and a directory with anything
+					 * in it cannot be removed here: it is renamed out of the way instead (one rename,
+					 * whatever it holds), and the copy starts under a name of its own.
+					 */
+					/*
+					 * Every attempt gets a name of its own: a half-made copy of an earlier boot (and
+					 * there may be several) is then neither in the way nor mistaken for a whole one.
+					 */
+					static char fresh[64];
+
+					static const char *const names[] = { "/private/var/jb.new.1", "/private/var/jb.new.2",
+					    "/private/var/jb.new.3", "/private/var/jb.new.4", "/private/var/jb.new.5",
+					    "/private/var/jb.new.6", "/private/var/jb.new.7", "/private/var/jb.new.8" };
+
+					to = NULL;
+					for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+						if (mkdir(names[i], 0755) == 0) {
+							chown(names[i], 0, 0);
+							to = names[i];
+							break;
+						}
+					}
+					if (to == NULL) {
+						printf("  no free name for the copy of the prefix\n");
+						grafted = 0;
+					}
+				}
+				/*
+				 * A copy that a stopped boot leaves half-made must not be taken for the prefix
+				 * next time: it is made under another name and renamed when it is whole, so
+				 * jb/usr is either missing (the copy is made again) or a complete tree.
+				 */
+				grafted = to != NULL && graft_tree(jb, to, 1, full, &dirs, &entries);
+				if (full && grafted) {
+					if (rename(to, "/private/var/jb") == 0) {
+						int fd;
+
+						to = "/private/var/jb";
+						fd = open("/private/var/jb/.hakios-copy", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+						if (fd >= 0) {
+							(void)write(fd, "copy\n", 5);
+							close(fd);
+						}
+						printf("  the prefix copied to /private/var/jb: %d entries\n", entries);
+					} else {
+						printf("  the copy in /private/var/jb.new: %s\n", strerror(errno));
+						grafted = 0;
+					}
+				}
+			}
+		}
 
 		/*
 		 * All of it belongs to root, as it does on a phone, but for the user's corner of it: an
