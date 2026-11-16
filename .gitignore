@@ -96,3 +96,8 @@ __pycache__/
 /xnuloader/identity.h
 !/xnuloader/im4p.py
 !/xnuloader/mkidentity.sh
+
+# backups and built tools that are not source
+/xnu/files.bak-*/
+/xnu/hakios.patch.bak-*
+/tools/apfs/apfs-tool
