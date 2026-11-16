@@ -1515,7 +1515,36 @@ mount_writable(void)
 	}
 	if (ok && jb != NULL) {
 		const char *to = "/private/var/jb";
-		int dirs = 0, entries = 0, grafted, users = 0;
+		int dirs = 0, entries = 0, grafted = 1, users = 0, mounted = 0;
+
+		/*
+		 * /redwood/etc/jb.mount: the prefix is a container of its own on the phone's storage --
+		 * written once with dd at 73728 MB into userdata, after the data volume (48 GiB from
+		 * 8192 MB) and before the iOS volume (80 GiB) -- and mounted read-write here.  Nothing is
+		 * copied at boot then, and what apt installs stays installed.  (A copy of the tree takes
+		 * about an hour through this port: 1.7 files a second, measured.)
+		 */
+		if (stat("/redwood/etc/jb.mount", &st) == 0) {
+			static const char *const jb_spec = "ufs_userdata,b=73728";
+			static const char *const mobiles[] = { "/private/var/jb/var/mobile",
+			    "/private/var/jb/var/mobile/Library", "/private/var/jb/var/mobile/Library/Caches",
+			    "/private/var/jb/var/mobile/Library/Preferences", "/private/var/jb/var/mobile/Documents",
+			    "/private/var/jb/var/lib/apt/sileolists", "/private/var/jb/var/lib/apt/sileolists/partial" };
+
+			mkdir("/private/var/jb", 0755);
+			if (mount("apfs", "/private/var/jb", 0, (void *)jb_spec) == 0) {
+				mounted = 1;
+				printf("  the prefix: the container at %s, mounted read-write on /private/var/jb\n", jb_spec);
+				for (unsigned i = 0; i < sizeof(mobiles) / sizeof(mobiles[0]); i++) {
+					mkdir(mobiles[i], 0755);
+					chown(mobiles[i], 501, 501);
+				}
+				own_tree("/private/var/jb/var/mobile", 501);
+			} else {
+				printf("  the prefix from the flash (%s): %s; grafted instead\n", jb_spec, strerror(errno));
+			}
+		}
+		if (!mounted) {
 
 		/*
 		 * With the root on the flash, the prefix's writable copy goes into a memory filesystem of its own
@@ -1620,6 +1649,8 @@ mount_writable(void)
 					}
 				}
 			}
+		}
+
 		}
 
 		/*
